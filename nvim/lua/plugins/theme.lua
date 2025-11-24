@@ -1,0 +1,1 @@
+/home/kasey/.config/omarchy/current/theme/neovim.lua
