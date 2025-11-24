@@ -1,0 +1,11 @@
+*
+!.gitignore
+
+!ghostty/
+!ghostty/**
+
+!yazi/
+!yazi/**
+
+!nvim/
+!nvim/**
