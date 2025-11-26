@@ -1,7 +1,75 @@
 [mgr]
 prepend_keymap = [
+  # Hopping
   { on = "i", run = "arrow prev", desc = "Previous file" },
 	{ on = "k", run = "arrow next", desc = "Next file" },
+
+  # Navigation
   { on = "j", run = "leave", desc = "Back to the parent directory" },
 	{ on = "l", run = "enter", desc = "Enter the child directory" },
+
+  { on = "H", run = "back",    desc = "Back to previous directory" },
+	{ on = "L", run = "forward", desc = "Forward to next directory" },
+
+  # Seeking
+  { on = "I", run = "seek -5", desc = "Seek up 5 units in the preview" },
+  { on = "K", run = "seek 5",  desc = "Seek down 5 units in the preview" },
+]
+
+[tasks]
+
+prepend_keymap = [
+	{ on = "i", run = "arrow prev", desc = "Previous option" },
+	{ on = "k", run = "arrow next", desc = "Next option" },
+]
+
+[spot]
+
+prepend_keymap = [
+	{ on = "i", run = "arrow prev", desc = "Previous option" },
+	{ on = "k", run = "arrow next", desc = "Next option" },
+  { on = "j", run = "swipe prev", desc = "Swipe to previous file" },
+	{ on = "l", run = "swipe next", desc = "Swipe to next file" },
+]
+
+[pick]
+
+prepend_keymap = [
+	{ on = "k", run = "arrow prev", desc = "Previous option" },
+	{ on = "j", run = "arrow next", desc = "Next option" },
+]
+
+[input]
+
+prepend_keymap = [
+	# Mode
+	{ on = "h", run = "insert",                          desc = "Enter insert mode" },
+	{ on = "H", run = [ "move first-char", "insert" ],   desc = "Move to the BOL, and enter insert mode" },
+
+	# Character-wise movement
+	{ on = "j",       run = "move -1", desc = "Move back a character" },
+
+	# Line-wise movement
+	{ on = "<Home>",      run = "move first-char", desc = "Move to the first non-whitespace character" },
+	{ on = "<End>",       run = "move first-char", desc = "Move to the first non-whitespace character" },
+]
+
+[confirm]
+prepend_keymap = [
+  { on = "i", run = "arrow prev", desc = "Previous line" },
+	{ on = "k", run = "arrow next", desc = "Next line" },
+
+]
+
+[cmp]
+prepend_keymap = [
+	{ on = "<A-i>", run = "arrow prev", desc = "Previous line" },
+	{ on = "<A-k>", run = "arrow next", desc = "Next line" },
+]
+
+[help]
+prepend_keymap = [
+  # Navigation
+	{ on = "i", run = "arrow prev", desc = "Previous line" },
+	{ on = "k", run = "arrow next", desc = "Next line" },
 ]

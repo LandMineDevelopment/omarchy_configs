@@ -9,3 +9,6 @@
 
 !nvim/
 !nvim/**
+
+!omarchy/themes/mytheme
+!omarchy/themes/mytheme/**
