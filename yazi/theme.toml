@@ -27,11 +27,12 @@ overall = {}
 # : Manager {{{
 
 [mgr]
-cwd = { fg = "yellow" }
+cwd = { fg = "#66cccc" }
 
 # Hovered
-hovered         = { fg = "yellow", reversed = true }
-preview_hovered = { underline = true }
+# hovered         = { fg = "yellow", reversed = true }
+hovered         = { fg = "#ffcc66", reversed = true }
+preview_hovered = { underline = true, dim = true }
 
 # Find
 find_keyword  = { fg = "yellow", bold = true, italic = true, underline = true }
@@ -53,7 +54,7 @@ count_selected = { fg = "black", bg = "yellow" }
 
 # Border
 border_symbol = "│"
-border_style  = { fg = "yellow" }
+border_style  = { fg = "blue" }
 
 # Highlighting
 syntect_theme = ""
@@ -64,11 +65,11 @@ syntect_theme = ""
 # : Tabs {{{
 
 [tabs]
-active   = { bg = "yellow", bold = true }
-inactive = { fg = "yellow", bg = "gray" }
+active   = { fg = "black", bg = "yellow", bold = true }
+inactive = { fg = "yellow", bg = "darkgray" }
 
 # Separator
-sep_inner = { open = "", close = "" }
+sep_inner = { open = "", close = "", fg = "yellow" }
 sep_outer = { open = "", close = "" }
 
 # : }}}
@@ -77,8 +78,9 @@ sep_outer = { open = "", close = "" }
 # : Mode {{{
 
 [mode]
-normal_main = { bg = "blue", bold = true }
-normal_alt  = { fg = "blue", bg = "gray" }
+normal_main = { fg = "black", bg = "yellow", bold = true }
+# normal_alt  = { fg = "black", bg = "green" }
+normal_alt  = { fg = "black", bg = "#66cc66" }
 
 # Select mode
 select_main = { bg = "red", bold = true }
@@ -218,8 +220,8 @@ hovered = { fg = "magenta", bold = true }
 # : Help menu {{{
 
 [help]
-on      = { fg = "cyan" }
-run     = { fg = "magenta" }
+on      = { fg = "green" }
+run     = { fg = "yellow" }
 desc    = {}
 hovered = { reversed = true, bold = true }
 footer  = { fg = "black", bg = "white" }
@@ -263,16 +265,16 @@ dirs  = [
 	{ name = ".git", text = "" },
 	{ name = ".github", text = "" },
 	{ name = ".npm", text = "" },
-	{ name = "Desktop", text = "", fg = "yellow" },
-	{ name = "Development", text = "" },
-	{ name = "Documents", text = "" },
-	{ name = "Downloads", text = "" },
-	{ name = "Library", text = "" },
-	{ name = "Movies", text = "" },
-	{ name = "Music", text = "" },
-	{ name = "Pictures", text = "" },
-	{ name = "Public", text = "" },
-	{ name = "Videos", text = "" },
+	{ name = "Desktop", text = "", fg = "magenta" },
+	{ name = "Development", text = "", fg = "magenta" },
+	{ name = "Documents", text = "", fg = "magenta" },
+	{ name = "Downloads", text = "", fg = "magenta" },
+	{ name = "Library", text = "", fg = "magenta" },
+	{ name = "Movies", text = "", fg = "magenta" },
+	{ name = "Music", text = "", fg = "magenta" },
+	{ name = "Pictures", text = "", fg = "magenta" },
+	{ name = "Public", text = "", fg = "magenta" },
+	{ name = "Videos", text = "", fg = "magenta" },
 ]
 files = [
 	{ name = ".babelrc", text = "", fg = "#cbcb41" },
@@ -951,8 +953,8 @@ conds = [
 
 	# Fallback
 	{ if = "dir", text = "", fg = "yellow" },
-	{ if = "exec", text = "" },
-	{ if = "!dir", text = "" },
+	{ if = "exec", text = "", fg = "green" },
+	{ if = "!dir", text = "", fg = "blue" },
 ]
 
 # : }}}
