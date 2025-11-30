@@ -9,3 +9,6 @@
 
 !nvim/
 !nvim/**
+
+!personal_settings/
+!personal_settings/**
