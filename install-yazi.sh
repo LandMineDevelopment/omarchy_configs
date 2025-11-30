@@ -16,3 +16,7 @@ else
     echo "alias y='yazi'" >> ~/.bashrc
     echo "successfully added yazi alias"
 fi
+source ~/.bashrc
+echo "successfully sourced .bashrc"
+
+
