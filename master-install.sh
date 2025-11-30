@@ -8,7 +8,7 @@
 # add shell shortcuts
 
 # check if .bashrc exists
-if [! -f ~/.bashrc]; then
+if [ ! -f ~/.bashrc ]; then
     echo "missing bashrc file!"
     exit 1
 fi
