@@ -55,8 +55,14 @@ local function delete_to_black_hole()
   return [["_d]]
 end
 
+-- change "d" function
 vim.keymap.set("n", "d", delete_to_black_hole, { expr = true, desc = "Delete without yanking" })
 vim.keymap.set("v", "d", delete_to_black_hole, { expr = true, desc = "Delete without yanking" })
 
--- Quit Neovim with Super+Q
+-- Make capital D behave exactly like lowercase d
+vim.keymap.set("n", "D", "d", { noremap = true, desc = "Same as d" })
+vim.keymap.set("v", "D", "d", { noremap = true, desc = "Same as d" })
+
+-- Quit Neovim with Q
 vim.keymap.set("n", "q", ":q<CR>", { desc = "Quit Neovim" })
+vim.keymap.set("n", "<S-q>", ":wq<CR>", { desc = "Save Quit Neovim" })
