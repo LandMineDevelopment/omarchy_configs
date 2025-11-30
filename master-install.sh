@@ -2,7 +2,6 @@
 
 # install programs
 . ./install-yazi.sh
-. ./install-stow.sh
 
 
 # pull .config files from repo and migrate to appropriate places
