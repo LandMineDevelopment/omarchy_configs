@@ -5,20 +5,6 @@
 # install programs
 . ./install-yazi.sh
 
-# add shell shortcuts
-
-# check if .bashrc exists
-if [ ! -f ~/.bashrc ]; then
-    echo "missing bashrc file!"
-    exit 1
-fi
-# check if yazi alias exists
-if grep -Fxq "alias y='yazi'" ~.bashrc; then
-    echo "yazi alias already exists"
-else
-    echo "setting alias y='yazi'"
-    echo "" >> "alias y='yazi'" 
-fi
 
 # pull .config files from repo and migrate to appropriate places
 if [ -d "omarchy_configs" ]; then
