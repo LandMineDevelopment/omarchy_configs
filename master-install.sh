@@ -18,6 +18,7 @@ if grep -Fxq "alias y='yazi'"; then
 else
     echo "setting alias y='yazi'"
     echo "" >> "alias y='yazi'" 
+fi
 
 # pull .config files from repo and migrate to appropriate places
 if [ -d "omarchy_configs" ]; then
