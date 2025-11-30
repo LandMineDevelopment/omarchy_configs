@@ -1,5 +1,7 @@
 #!/bin/sh
 
+#IMPORTANT: run "chmod +x master-install.sh" to ensure permissions to run are set
+
 # install programs
 . ./install-yazi.sh
 
