@@ -57,3 +57,6 @@ end
 
 vim.keymap.set("n", "d", delete_to_black_hole, { expr = true, desc = "Delete without yanking" })
 vim.keymap.set("v", "d", delete_to_black_hole, { expr = true, desc = "Delete without yanking" })
+
+-- Quit Neovim with Super+Q
+vim.keymap.set("n", "q", ":q<CR>", { desc = "Quit Neovim" })
