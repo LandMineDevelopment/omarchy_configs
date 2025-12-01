@@ -4,33 +4,33 @@
 
 # install programs
 . ./install-yazi.sh
-
+. ./install-lazygit.sh
 
 # pull .config files from repo and migrate to appropriate places
 if [ -d "omarchy_configs" ]; then
-    echo "omarchy_configs exists. Deleting before pulling"
-    sudo rm -r omarchy_configs
-    git clone https://github.com/LandMineDevelopment/omarchy_configs
+  echo "omarchy_configs exists. Deleting before pulling"
+  sudo rm -r omarchy_configs
+  git clone https://github.com/LandMineDevelopment/omarchy_configs
 else
-    echo "omarchy_configs does not exist. Pulling from repo"
-    git clone https://github.com/LandMineDevelopment/omarchy_configs
+  echo "omarchy_configs does not exist. Pulling from repo"
+  git clone https://github.com/LandMineDevelopment/omarchy_configs
 fi
 
 if [ -d ~/.config/.git ]; then
-    echo ".git exists. Deleting before pulling"
-    sudo rm -r ~/.config/.git
-    mv omarchy_configs/.git ~/.config/.git
+  echo ".git exists. Deleting before pulling"
+  sudo rm -r ~/.config/.git
+  mv omarchy_configs/.git ~/.config/.git
 else
-    echo ".git does not exist. Pulling from repo"
-    mv omarchy_configs/.git ~/.config/.git
+  echo ".git does not exist. Pulling from repo"
+  mv omarchy_configs/.git ~/.config/.git
 fi
 
 if [ -f ~/.config/.gitignore ]; then
-    echo ".gitignore exists. Deleting before pulling"
-    sudo rm -r ~/.config/.gitignore
+  echo ".gitignore exists. Deleting before pulling"
+  sudo rm -r ~/.config/.gitignore
 else
-    echo ".gitignore does not exist. Pulling from repo"
-    mv omarchy_configs/.gitignore ~/.config/.gitignore
+  echo ".gitignore does not exist. Pulling from repo"
+  mv omarchy_configs/.gitignore ~/.config/.gitignore
 fi
 
 # reset and pull from repo
@@ -43,4 +43,3 @@ omarchy-theme-install https://github.com/LandMineDevelopment/primary-space
 
 # install alacritty if issues with ghostty
 # omarchy-install-terminal alacritty
-
