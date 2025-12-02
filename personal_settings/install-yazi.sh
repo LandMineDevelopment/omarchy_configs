@@ -25,5 +25,12 @@ else
   echo "bind -x '\"\C-y\": \"yazi\"'" >>~/.bashrc
   echo "successfully added yazi ctrl-y keybind"
 fi
-source ~/.bashrc
-echo "successfully sourced .bashrc"
+# check if super-y keybind for yazi exists
+if grep -Fxq "bindd = SUPER, Y, Yazi, exec, omarchy-launch-tui yazi" ~/.config/hypr/bindings.conf; then
+  echo "super-y keybind for yazi already exists"
+else
+  echo "setting yazi super-y keybind"
+  echo "" >>~/.config/hypr/bindings.conf
+  echo "bindd = SUPER, Y, Yazi, exec, omarchy-launch-tui yazi" >>~/.config/hypr/bindings.conf
+  echo "successfully added yazi super-y keybind"
+fi

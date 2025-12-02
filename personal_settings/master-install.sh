@@ -43,3 +43,5 @@ omarchy-theme-install https://github.com/LandMineDevelopment/primary-space
 
 # install alacritty if issues with ghostty
 # omarchy-install-terminal alacritty
+
+omarchy-update

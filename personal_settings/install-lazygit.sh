@@ -18,7 +18,7 @@ else
 fi
 # check if ctrl-l keybind for lazygit exists
 if grep -Fxq "bind -x '\"\C-l\": \"lazygit\"'" ~/.bashrc; then
-  echo "ctrl-y keybind for yazi already exists"
+  echo "ctrl-l keybind for lazygit already exists"
 else
   echo "setting lazygit ctrl-l keybind"
   echo "" >>~/.bashrc
