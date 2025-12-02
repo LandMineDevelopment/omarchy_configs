@@ -7,22 +7,29 @@ if [ ! -f ~/.bashrc ]; then
   echo "missing bashrc file!"
   exit 1
 fi
+
 # check if yazi alias exists
-if grep -Fxq "alias y='yazi'" ~/.bashrc; then
-  echo "yazi alias already exists"
+if grep -Fxq "function y() {" ~/.bashrc; then
+  echo "yazi bashrc function already exists"
 else
-  echo "setting alias y='yazi'"
+  echo "setting function y() in bashrc"
   echo "" >>~/.bashrc
-  echo "alias y='yazi'" >>~/.bashrc
+  echo 'function y() {
+  local tmp="$(mktemp -t "yazi-cwd.XXXXXX")" cwd
+  yazi "$@" --cwd-file="$tmp"
+  IFS= read -r -d '\'''\'' cwd <"$tmp"
+  [ -n "$cwd" ] && [ "$cwd" != "$PWD" ] && builtin cd -- "$cwd"
+  rm -f -- "$tmp"
+}' >>~/.bashrc
   echo "successfully added yazi alias"
 fi
 # check if ctrl-y keybind for yazi exists
-if grep -Fxq "bind -x '\"\C-y\": \"yazi\"'" ~/.bashrc; then
+if grep -Fxq "bind -x '\"\C-y\":y; bash -i'" ~/.bashrc; then
   echo "ctrl-y keybind for yazi already exists"
 else
   echo "setting yazi ctrl-y keybind"
   echo "" >>~/.bashrc
-  echo "bind -x '\"\C-y\": \"yazi\"'" >>~/.bashrc
+  echo "bind -x '\"\C-y\":y; bash -i'" >>~/.bashrc
   echo "successfully added yazi ctrl-y keybind"
 fi
 # check if super-y keybind for yazi exists
