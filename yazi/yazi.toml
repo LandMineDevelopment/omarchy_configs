@@ -3,9 +3,9 @@ ratio = [1,2,3]
 
 [opener]
 bash = [
-  { run = './"$1"', desc = "bash", block = true, for = "unix"}
+  { run = 'bash "$@"', desc = "bash", block = true, for = "unix"}
 ]
 [open]
 prepend_rules = [
-	{ name = "*.sh", use = "bash" },
+	{ name = "*.sh", use = ["edit","bash"] },
 ]
