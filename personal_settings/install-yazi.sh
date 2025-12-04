@@ -33,11 +33,17 @@ else
   echo "successfully added yazi ctrl-y keybind"
 fi
 # check if super-y keybind for yazi exists
+# check if hypr/bindings.conf exists
+if [ ! -f ~/.config/hypr/bindings.conf ]; then
+  echo "missing ~/.config/hypr/bindings.conf file!"
+  exit 1
+fi
 if grep -Fxq "bindd = SUPER, Y, Yazi, exec, omarchy-launch-tui yazi" ~/.config/hypr/bindings.conf; then
   echo "super-y keybind for yazi already exists"
 else
   echo "setting yazi super-y keybind"
   echo "" >>~/.config/hypr/bindings.conf
   echo "bindd = SUPER, Y, Yazi, exec, omarchy-launch-tui yazi" >>~/.config/hypr/bindings.conf
+  hyprctl reload
   echo "successfully added yazi super-y keybind"
 fi
