@@ -24,12 +24,12 @@ else
   echo "successfully added yazi alias"
 fi
 # check if ctrl-y keybind for yazi exists
-if grep -Fxq "bind -x '\"\C-y\":y; bash -i'" ~/.bashrc; then
+if grep -Fxq 'bind "\C-y\":"\C-ay\C-m"' ~/.bashrc; then
   echo "ctrl-y keybind for yazi already exists"
 else
   echo "setting yazi ctrl-y keybind"
   echo "" >>~/.bashrc
-  echo "bind -x '\"\C-y\":y; bash -i'" >>~/.bashrc
+  echo 'bind "\C-y\":"\C-ay\C-m"' >>~/.bashrc
   echo "successfully added yazi ctrl-y keybind"
 fi
 # check if super-y keybind for yazi exists
