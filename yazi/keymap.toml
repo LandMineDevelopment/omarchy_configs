@@ -37,8 +37,8 @@ prepend_keymap = [
 [pick]
 
 prepend_keymap = [
-	{ on = "k", run = "arrow prev", desc = "Previous option" },
-	{ on = "j", run = "arrow next", desc = "Next option" },
+	{ on = "i", run = "arrow prev", desc = "Previous option" },
+	{ on = "k", run = "arrow next", desc = "Next option" },
 ]
 
 [input]
