@@ -38,10 +38,12 @@ git -C ~/.config reset --hard HEAD~1
 git -C ~/.config pull
 rm -r omarchy_configs
 
-# install theme
-omarchy-theme-install https://github.com/LandMineDevelopment/primary-space
+if [ -d "~/.config/omarchy" ]; then
+  # install theme
+  omarchy-theme-install https://github.com/LandMineDevelopment/primary-space
 
-# install alacritty if issues with ghostty
-# omarchy-install-terminal alacritty
+  # install alacritty if issues with ghostty
+  # omarchy-install-terminal alacritty
 
-omarchy-update
+  omarchy-update
+fi
