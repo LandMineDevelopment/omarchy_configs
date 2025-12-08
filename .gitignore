@@ -7,8 +7,18 @@
 !yazi/
 !yazi/**
 
+!personal_settings/
+!personal_settings/**
+
 !nvim/
 !nvim/**
 
-!personal_settings/
-!personal_settings/**
+nvim/tt.*
+nvim/.tests
+nvim/doc/tags
+nvim/debug
+nvim/.repro
+nvim/foo.*
+nvim/*.log
+nvim/data
+
