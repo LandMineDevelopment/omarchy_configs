@@ -36,8 +36,6 @@ else
 fi
 
 # reset and pull from repo
-git -C ~/.config reset --hard HEAD~1
-git -C ~/.config pull
 rm -r omarchy_configs
 
 if [ -d "~/.config/omarchy" ]; then
