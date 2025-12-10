@@ -4,6 +4,9 @@
 !ghostty/
 !ghostty/**
 
+!xterm/
+!xterm/**
+
 !yazi/
 !yazi/**
 
