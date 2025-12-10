@@ -2,11 +2,16 @@
 
 #IMPORTANT: run "chmod +x master-install.sh" to ensure permissions to run are set
 
-# install programs
+# install programs#############
+# packagemanager
 . ./install-yay.sh
+# file managers
 . ./install-yazi.sh
-. ./install-lazygit.sh
 . ./install-nnn.sh
+# git
+. ./install-lazygit.sh
+# editors
+# terminals
 
 # pull .config files from repo and migrate to appropriate places
 if [ -d "omarchy_configs" ]; then
