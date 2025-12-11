@@ -1,6 +1,6 @@
 #!/bin/sh
 
-yay -S --noconfirm --needed lazygit
+sudo yay -S --noconfirm --needed lazygit
 
 # check if .bashrc exists
 if [ ! -f ~/.bashrc ]; then

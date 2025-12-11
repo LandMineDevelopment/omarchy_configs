@@ -1,7 +1,7 @@
 #!/bin/sh
 
-yay -S --noconfirm --needed xorg-xrdb
-yay -S --noconfirm --needed xterm
+sudo yay -S --noconfirm --needed xorg-xrdb
+sudo yay -S --noconfirm --needed xterm
 
 git_cloned=0
 TARGET_DIR="$HOME/.config/xterm"

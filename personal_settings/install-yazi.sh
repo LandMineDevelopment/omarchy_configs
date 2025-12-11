@@ -1,6 +1,6 @@
 #!/bin/sh
 
-yay -S --noconfirm --needed yazi
+sudo yay -S --noconfirm --needed yazi
 
 # check if .bashrc exists
 if [ ! -f ~/.bashrc ]; then
