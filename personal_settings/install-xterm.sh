@@ -37,6 +37,9 @@ else
   cp -r omarchy_configs/xterm "$TARGET_DIR"
   echo "Directory created: $TARGET_DIR"
 fi
+
+xrdb "$TARGET_DIR/Xresources"
+
 if [ "$git_cloned" -eq 1 ]; then
   echo "deleting temp clone"
   rm -rf "omarchy_configs"
