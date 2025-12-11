@@ -3,19 +3,16 @@
 yay -S --noconfirm --needed xorg-xrdb
 yay -S --noconfirm --needed xterm
 
-# if [ -f ~/.config/xterm/ ]; then
-#   echo "xterm configs exists.Do you want to overwrite?"
-#   sudo rm -r ~/.config/.gitignore
-# else
-#   echo ".gitignore does not exist. Pulling from repo"
-#   mv omarchy_configs/.gitignore ~/.config/.gitignore
-# fi
-
+git_cloned=0
 TARGET_DIR="$HOME/.config/xterm"
+
 if [ ! -d "omarchy_configs/xterm" ]; then
   echo "omarchy_confis does not exist. Temp clone the repo"
   git clone https://github.com/LandMineDevelopment/omarchy_configs
+  git_cloned=1
 fi
+
+echo "$git_cloned"
 
 if [ -d "$TARGET_DIR" ]; then
   echo "Warning: Directory '$TARGET_DIR' already exists."
@@ -26,7 +23,7 @@ if [ -d "$TARGET_DIR" ]; then
 
     if [[ "$answer" =~ ^[Yy]$ ]]; then
       echo "Deleting existing directory..."
-      rm -rf "$TARGET_DIR" && cp omarchy_configs/xterm "$TARGET_DIR"
+      rm -rf "$TARGET_DIR" && cp -r omarchy_configs/xterm "$TARGET_DIR"
       echo "Directory overwritten successfully."
       break
     elif [[ "$answer" =~ ^[Nn]$ ]]; then
@@ -37,6 +34,10 @@ if [ -d "$TARGET_DIR" ]; then
     fi
   done
 else
-  mv omarchy_configs/xterm "$TARGET_DIR"
+  cp -r omarchy_configs/xterm "$TARGET_DIR"
   echo "Directory created: $TARGET_DIR"
+fi
+if [ "$git_cloned" -eq 1 ]; then
+  echo "deleting temp clone"
+  rm -rf "omarchy_configs"
 fi
