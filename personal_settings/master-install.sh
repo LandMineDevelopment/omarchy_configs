@@ -2,17 +2,6 @@
 
 #IMPORTANT: run "chmod +x master-install.sh" to ensure permissions to run are set
 
-# install programs#############
-# packagemanager
-. ./install-yay.sh
-# file managers
-. ./install-yazi.sh
-. ./install-nnn.sh
-# git
-. ./install-lazygit.sh
-# editors
-# terminals
-
 # pull .config files from repo and migrate to appropriate places
 if [ -d "omarchy_configs" ]; then
   echo "omarchy_configs exists. Deleting before pulling"
@@ -39,6 +28,18 @@ else
   echo ".gitignore does not exist. Pulling from repo"
   mv omarchy_configs/.gitignore ~/.config/.gitignore
 fi
+
+# install programs#############
+# packagemanager
+. ./install-yay.sh
+# file managers
+. ./install-yazi.sh
+. ./install-nnn.sh
+# git
+. ./install-lazygit.sh
+# editors
+# terminals
+. ./install-xterm.sh
 
 # reset and pull from repo
 rm -r omarchy_configs
