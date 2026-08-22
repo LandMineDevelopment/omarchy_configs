@@ -1,0 +1,1 @@
+# Omarchy supplies the compositor, shell, portals, and desktop services.

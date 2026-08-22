@@ -1,0 +1,26 @@
+# Standalone desktop components for a basic Arch installation.
+base-devel
+grim
+brave-bin
+bluez
+bluez-utils
+gnome-keyring
+hypridle
+hyprland
+hyprlock
+hyprpolkitagent
+imv
+libsecret
+mako
+mpv
+network-manager-applet
+pavucontrol
+pipewire
+pipewire-alsa
+pipewire-pulse
+slurp
+swaybg
+waybar
+wofi
+xdg-desktop-portal-hyprland
+xdg-desktop-portal-gtk

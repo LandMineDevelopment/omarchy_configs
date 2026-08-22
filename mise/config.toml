@@ -1,0 +1,6 @@
+[tools]
+claude = "latest"
+codex = "latest"
+node = "25.2.1"
+"npm:@xai-official/grok" = "latest"
+opencode = "latest"

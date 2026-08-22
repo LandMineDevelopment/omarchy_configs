@@ -1,24 +1,60 @@
+# This repository lives in ~/.config. Ignore everything by default and only
+# expose reviewed, portable configuration below. Never replace this with a
+# broad allow rule: ~/.config also contains credentials and application state.
 *
+
 !.gitignore
+!README.md
+!bootstrap.sh
+!packages.txt
+!profiles/
+!profiles/**
+
+!alacritty/
+!alacritty/alacritty.toml
+
+!autostart/
+!autostart/*.desktop
+
+!bash/
+!bash/portable.bash
+
+!btop/
+!btop/btop.conf
+
+!brave-flags.conf
+!chromium-flags.conf
+
+!fcitx5/
+!fcitx5/profile
+!fcitx5/conf/
+!fcitx5/conf/clipboard.conf
+!fcitx5/conf/notifications.conf
+!fcitx5/conf/xcb.conf
 
 !ghostty/
-!ghostty/**
+!ghostty/config
 
-!xterm/
-!xterm/**
+!git/
+!git/config
 
-!yazi/
-!yazi/**
-
-!personal_settings/
-!personal_settings/**
+!herdr/
+!herdr/config.toml
 
 !hypr/
-!hypr/monitors.lua
+!hypr/.luarc.json
+!hypr/*.lua
+
+!kitty/
+!kitty/kitty.conf
+
+!mimeapps.list
+
+!mise/
+!mise/config.toml
 
 !nvim/
 !nvim/**
-
 nvim/tt.*
 nvim/.tests
 nvim/doc/tags
@@ -27,3 +63,28 @@ nvim/.repro
 nvim/foo.*
 nvim/*.log
 nvim/data
+
+!omarchy/
+!omarchy/defaults/
+!omarchy/defaults/agent
+!omarchy/extensions/
+!omarchy/extensions/omarchy-menu.jsonc
+!omarchy/shell.json
+
+!starship.toml
+
+!system/
+!system/**
+
+!tmux/
+!tmux/tmux.conf
+
+!wireplumber/
+!wireplumber/wireplumber.conf.d/
+!wireplumber/wireplumber.conf.d/bluetooth-a2dp-autoconnect.conf
+
+!xterm/
+!xterm/Xresources
+
+!yazi/
+!yazi/**

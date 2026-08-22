@@ -7,5 +7,5 @@ bash = [
 ]
 [open]
 prepend_rules = [
-	{ name = "*.sh", use = ["edit","bash"] },
+	{ url = "*.sh", use = ["edit","bash"] },
 ]

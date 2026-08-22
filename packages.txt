@@ -1,0 +1,20 @@
+# Portable tools used by the tracked configuration. bootstrap.sh can install
+# missing entries with: ./bootstrap.sh --install-packages
+alacritty
+btop
+fcitx5
+ghostty
+herdr
+kitty
+lazygit
+mise
+neovim
+nnn
+starship
+tmux
+wireplumber
+wl-clipboard
+xorg-xrdb
+xterm
+yazi
+ttf-jetbrains-mono-nerd
