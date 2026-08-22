@@ -13,6 +13,9 @@
 !personal_settings/
 !personal_settings/**
 
+!hypr/
+!hypr/monitors.lua
+
 !nvim/
 !nvim/**
 
@@ -24,4 +27,3 @@ nvim/.repro
 nvim/foo.*
 nvim/*.log
 nvim/data
-
