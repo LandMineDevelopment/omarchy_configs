@@ -1,1 +1,8 @@
-/opt/Synology/SynologyDrive/synology-drive-autostart
+[Desktop Entry]
+Name=Synology Drive Client
+Comment=Synology Drive Client
+Exec=synology-drive autostart
+Icon=synology-drive
+Terminal=false
+Type=Application
+Categories=Network;FileTransfer;
