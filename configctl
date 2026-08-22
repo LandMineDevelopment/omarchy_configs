@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=lib/components.sh
+source "$repo_root/lib/components.sh"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./configctl list
+  ./configctl status COMPONENT
+  ./configctl diff COMPONENT [REVISION]
+  ./configctl log COMPONENT
+  ./configctl stash COMPONENT [MESSAGE]
+  ./configctl restore COMPONENT REVISION
+  ./configctl stage COMPONENT
+
+Maintain one configuration component without touching other components or the
+independent Primary Space repository. Restore writes an older revision into the
+working tree for testing; it does not move the branch or create a commit. It
+refuses to overwrite component changes, so stash them explicitly first.
+EOF
+}
+
+command_name="${1:-}"
+[[ -n "$command_name" ]] || { usage >&2; exit 2; }
+shift
+
+if [[ "$command_name" == list ]]; then
+  (($# == 0)) || { usage >&2; exit 2; }
+  component_list
+  exit 0
+fi
+
+component="${1:-}"
+[[ -n "$component" ]] || { usage >&2; exit 2; }
+shift
+
+paths=()
+component_paths "$component" paths
+
+component_status() {
+  git -C "$repo_root" --literal-pathspecs status --short --untracked-files=all -- "${paths[@]}"
+}
+
+stash_component() {
+  local message="$1" before after
+
+  before="$(git -C "$repo_root" rev-parse -q --verify refs/stash 2>/dev/null || true)"
+  git -C "$repo_root" --literal-pathspecs stash push --include-untracked -m "$message" -- "${paths[@]}"
+  after="$(git -C "$repo_root" rev-parse -q --verify refs/stash 2>/dev/null || true)"
+
+  if [[ -n "$after" && "$after" != "$before" ]]; then
+    printf 'Saved %s changes in stash %s.\n' "$component" "${after:0:12}"
+    printf 'Recover with: git stash apply --index %s\n' "$after"
+  else
+    printf 'No %s changes to stash.\n' "$component"
+  fi
+}
+
+case "$command_name" in
+  status)
+    (($# == 0)) || { usage >&2; exit 2; }
+    branch="$(git -C "$repo_root" branch --show-current)"
+    printf 'Component: %s (branch %s)\n' "$component" "${branch:-detached HEAD}"
+    status_output="$(component_status)"
+    if [[ -n "$status_output" ]]; then
+      printf '%s\n' "$status_output"
+    else
+      printf '%s\n' 'Clean.'
+    fi
+    ;;
+  diff)
+    (($# <= 1)) || { usage >&2; exit 2; }
+    revision="${1:-HEAD}"
+    git -C "$repo_root" rev-parse --verify --quiet "$revision^{commit}" >/dev/null || {
+      printf 'Unknown revision: %s\n' "$revision" >&2
+      exit 2
+    }
+    git -C "$repo_root" --literal-pathspecs diff "$revision" -- "${paths[@]}"
+    ;;
+  log)
+    (($# == 0)) || { usage >&2; exit 2; }
+    git -C "$repo_root" --literal-pathspecs log --oneline --decorate -- "${paths[@]}"
+    ;;
+  stash)
+    message="${*:-Manual $component checkpoint}"
+    stash_component "$message"
+    ;;
+  restore)
+    (($# == 1)) || { usage >&2; exit 2; }
+    revision="$1"
+    resolved_revision="$(git -C "$repo_root" rev-parse --verify --quiet "$revision^{commit}")" || {
+      printf 'Unknown revision: %s\n' "$revision" >&2
+      exit 2
+    }
+
+    if ! status_output="$(component_status)"; then
+      printf 'Could not inspect the %s component; restore was not attempted.\n' "$component" >&2
+      exit 1
+    fi
+    if [[ -n "$status_output" ]]; then
+      printf '%s has uncommitted changes; restore was not attempted.\n' "$component" >&2
+      printf 'Save them first with: ./configctl stash %s "Before restoring from %s"\n' "$component" "$revision" >&2
+      exit 1
+    fi
+
+    git -C "$repo_root" --literal-pathspecs restore --source="$resolved_revision" --worktree -- "${paths[@]}"
+    printf 'Restored %s from %s into the working tree.\n' "$component" "$revision"
+    printf '%s\n' "Review with: ./configctl diff $component"
+    printf '%s\n' "To return safely, stash this trial and then restore $component from HEAD."
+    ;;
+  stage)
+    (($# == 0)) || { usage >&2; exit 2; }
+    git -C "$repo_root" --literal-pathspecs add -A -- "${paths[@]}"
+    printf 'Updated the index only for %s; other staged changes were left intact.\n' "$component"
+    printf '%s\n' 'Review the complete index with: git diff --cached'
+    ;;
+  *)
+    printf 'Unknown command: %s\n' "$command_name" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

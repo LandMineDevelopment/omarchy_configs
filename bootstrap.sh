@@ -2,19 +2,27 @@
 set -euo pipefail
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=lib/components.sh
+source "$repo_root/lib/components.sh"
 config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 dry_run=false
 install_packages=false
 profile=auto
+declare -a requested_components=()
+declare -a selected_paths=()
+declare -A selected_component_names=()
 
 usage() {
   cat <<'EOF'
-Usage: ./bootstrap.sh [--profile auto|omarchy|arch] [--dry-run] [--install-packages]
+Usage: ./bootstrap.sh [--profile auto|omarchy|arch] [--component NAME] [--dry-run] [--install-packages]
 
 Restore the repository's portable user configuration into ~/.config.
 Existing files are backed up before they are changed. Hardware-specific files
 under system/ are documented but are never installed automatically. The auto
 profile uses Omarchy when available and otherwise selects basic Arch Linux.
+Repeat --component to restore only named components. Component selection cannot
+be combined with the repository-wide --install-packages operation. Run
+`./configctl list` to see the available component names.
 EOF
 }
 
@@ -22,6 +30,12 @@ while (($#)); do
   case "$1" in
     --dry-run) dry_run=true ;;
     --install-packages) install_packages=true ;;
+    --component=*) requested_components+=("${1#*=}") ;;
+    --component)
+      shift
+      (($#)) || { printf '%s\n' 'Missing value for --component' >&2; exit 2; }
+      requested_components+=("$1")
+      ;;
     --profile=*) profile="${1#*=}" ;;
     --profile)
       shift
@@ -32,6 +46,21 @@ while (($#)); do
     *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
   shift
+done
+
+if $install_packages && ((${#requested_components[@]})); then
+  printf '%s\n' '--install-packages is repository-wide and cannot be combined with --component.' >&2
+  exit 2
+fi
+
+for component in "${requested_components[@]}"; do
+  [[ -n "$component" ]] || { printf '%s\n' 'Component name cannot be empty.' >&2; exit 2; }
+  [[ -z "${selected_component_names[$component]+set}" ]] || continue
+
+  component_path_list=()
+  component_paths "$component" component_path_list || exit 2
+  selected_component_names["$component"]=1
+  selected_paths+=("${component_path_list[@]}")
 done
 
 if [[ "$profile" == auto ]]; then
@@ -51,6 +80,9 @@ fi
 }
 
 printf 'Using %s profile.\n' "$profile"
+if ((${#requested_components[@]})); then
+  printf 'Restoring components: %s\n' "${!selected_component_names[*]}"
+fi
 
 timestamp="$(date +%Y%m%d-%H%M%S)"
 backup_root="$HOME/.local/state/omarchy-config-backups/$timestamp"
@@ -83,10 +115,26 @@ restore_file() {
   cp -a -- "$source" "$destination"
 }
 
+path_is_selected() {
+  local path="$1" selected
+
+  ((${#selected_component_names[@]} == 0)) && return 0
+  for selected in "${selected_paths[@]}"; do
+    [[ "$path" == "$selected" || "$path" == "$selected/"* ]] && return 0
+  done
+  return 1
+}
+
+component_is_selected() {
+  local component="$1"
+  ((${#selected_component_names[@]} == 0)) || [[ -n "${selected_component_names[$component]+set}" ]]
+}
+
 while IFS= read -r -d '' path; do
   case "$path" in
-    .gitignore|README.md|bootstrap.sh|packages.txt|profiles/*|system/*) continue ;;
+    .gitignore|README.md|bootstrap.sh|components.conf|configctl|lib/*|packages.txt|profiles/*|system/*|tests/*) continue ;;
   esac
+  path_is_selected "$path" || continue
 
   if [[ "$profile" == arch ]]; then
     case "$path" in
@@ -101,11 +149,12 @@ profile_prefix="profiles/$profile/"
 while IFS= read -r -d '' path; do
   [[ "$path" == "$profile_prefix"* ]] || continue
   [[ "$path" == */packages.txt ]] && continue
+  path_is_selected "$path" || continue
   restore_file "$path" "${path#"$profile_prefix"}"
 done < <(git -C "$repo_root" ls-files -z --cached --others --exclude-standard)
 
 bash_source='source "$HOME/.config/bash/portable.bash"'
-if ! grep -Fqx -- "$bash_source" "$HOME/.bashrc" 2>/dev/null; then
+if component_is_selected bash && ! grep -Fqx -- "$bash_source" "$HOME/.bashrc" 2>/dev/null; then
   printf '%s Bash integration\n' "$($dry_run && printf 'Would add' || printf 'Adding')"
   ((changes += 1))
   if ! $dry_run; then

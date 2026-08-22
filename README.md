@@ -22,6 +22,19 @@ Arch profile. You can choose explicitly:
 ./bootstrap.sh --profile arch --install-packages
 ```
 
+Restore one or more application configurations without changing the others:
+
+```bash
+./configctl list
+./bootstrap.sh --profile omarchy --component yazi --dry-run
+./bootstrap.sh --profile omarchy --component yazi
+./bootstrap.sh --profile arch --component ghostty --component yazi
+```
+
+Package installation remains repository-wide and is intentionally separate
+from component restores, so `--component` and `--install-packages` cannot be
+combined.
+
 The restore is additive and idempotent. Before replacing a differing file, it
 copies the old version to `~/.local/state/omarchy-config-backups/<timestamp>/`.
 It never deletes an existing `~/.config` repository or application state.
@@ -60,8 +73,31 @@ normal application files, review `git status` and `git diff`, then commit only
 intentional changes. To add another config, explicitly allow its narrowest path
 in `.gitignore`; never allow an entire application-state directory by default.
 
+`components.conf` is the shared boundary used by the restore and maintenance
+tools. Each component owns narrow base and profile paths. Use `configctl` to
+work on one component without a hard reset or changes to other configurations:
+
+```bash
+./configctl status yazi
+./configctl diff yazi
+./configctl log yazi
+./configctl stash yazi "Before trying alternate colors"
+./configctl restore yazi <good-commit>
+./configctl stage yazi
+```
+
+`restore` places the selected revision in the working tree for testing without
+moving the branch or committing it. It refuses to overwrite existing component
+changes; save them first with a named `configctl stash`. The stash command
+prints the exact object ID and recovery command. To stop an experiment without
+losing it, stash the trial and then restore the component from `HEAD`. Stage and
+commit the component when the rollback should become durable. Keep commits
+focused on one component whenever practical.
+
 The Primary Space theme remains an independent repository at
 `~/.config/omarchy/themes/primary-space` so it can keep its own release history.
+It is deliberately absent from `components.conf` and remains ignored by the
+parent repository. Run Git commands from that directory to maintain the theme.
 
 ## Safety
 

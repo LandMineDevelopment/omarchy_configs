@@ -6,9 +6,15 @@
 !.gitignore
 !README.md
 !bootstrap.sh
+!components.conf
+!configctl
 !packages.txt
+!lib/
+!lib/components.sh
 !profiles/
 !profiles/**
+!tests/
+!tests/component-scoping.sh
 
 !alacritty/
 !alacritty/alacritty.toml
@@ -70,6 +76,9 @@ nvim/data
 !omarchy/extensions/
 !omarchy/extensions/omarchy-menu.jsonc
 !omarchy/shell.json
+# Primary Space stays an independent repository. Deliberately do not allow
+# omarchy/themes/ through the parent repository's deny-by-default boundary.
+omarchy/themes/
 
 !starship.toml
 
