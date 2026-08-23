@@ -34,6 +34,8 @@ vim.keymap.set("n", "<End>", "g_", { noremap = true, silent = true })
 -- INSERT MODE end settings
 vim.keymap.set("i", "<End>", "<C-o>g_<C-o>a", { noremap = true, silent = true })
 
+vim.keymap.set("i", "<C-BS>", "<C-w>", { desc = "Delete previous word" })
+
 -- VISUAL MODE end settings
 vim.keymap.set("v", "<End>", "g_", { noremap = true, silent = true })
 --
