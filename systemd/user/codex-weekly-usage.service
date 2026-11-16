@@ -6,4 +6,3 @@ Type=oneshot
 Environment=OMARCHY_PATH=/usr/share/omarchy
 ExecStart=/usr/bin/omarchy-agent-usage-update --limits-only codex
 TimeoutStartSec=50
-

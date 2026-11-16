@@ -81,4 +81,4 @@ PATH="$test_root/bin:$PATH" MOCK_LOG="$test_root/packages.log" run --install-pac
 grep -Fxq 'omarchy pkg add official-new' "$test_root/packages.log" || fail 'official package not installed through Omarchy'
 grep -Fxq 'yay -S --needed aur-new' "$test_root/packages.log" || fail 'AUR package not installed through yay'
 ! grep -q already-installed "$test_root/packages.log" || fail 'existing package reinstalled'
-printf '%s\n' 'Bootstrap safety checks passed.' 
+printf '%s\n' 'Bootstrap safety checks passed.'
