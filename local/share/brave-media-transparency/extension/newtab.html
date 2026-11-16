@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>New Tab</title>
+    <link rel="stylesheet" href="newtab.css">
+    <script src="geometry.js" defer></script>
+    <script src="content.js" defer></script>
+    <script src="newtab.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <form id="navigation" role="search">
+        <label for="destination" class="visually-hidden">Search Brave Search or enter a web address</label>
+        <div class="search-field">
+          <input id="destination" name="destination" type="text" placeholder="Search or enter an address"
+                 autocomplete="off" autocapitalize="off" spellcheck="false" required
+                 aria-describedby="search-provider">
+          <button type="submit" aria-label="Search or open address">Go</button>
+        </div>
+        <p id="search-provider">Brave Search</p>
+      </form>
+    </main>
+  </body>
+</html>

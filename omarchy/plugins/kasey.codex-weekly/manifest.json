@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "kasey.codex-weekly",
+  "name": "Codex Weekly Usage",
+  "version": "1.0.0",
+  "author": "kasey",
+  "description": "Codex weekly allowance from Omarchy's agent usage collector",
+  "kinds": ["bar-widget"],
+  "entryPoints": {"barWidget": "Weekly.qml"},
+  "barWidget": {"displayName": "Codex Weekly", "category": "System", "allowMultiple": false}
+}

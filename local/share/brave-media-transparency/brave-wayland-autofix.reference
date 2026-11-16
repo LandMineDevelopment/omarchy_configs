@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Omarchy post-update hook: retire the temporary Brave Wayland playback
+# workarounds once the upstream issue is closed and a newer Brave package is installed.
+set -euo pipefail
+
+readonly issue_api="https://api.github.com/repos/brave/brave-browser/issues/58528"
+readonly known_bad_version="1:1.95.101-1"
+readonly flags_file="${HOME}/.config/brave-flags.conf"
+readonly wrapper_file="${HOME}/.local/bin/brave-omarchy"
+readonly desktop_file="${HOME}/.local/share/applications/brave-browser.desktop"
+readonly state_dir="${HOME}/.local/state"
+readonly marker_file="$state_dir/brave-wayland-autofix.applied"
+
+check_only=false
+case "${1:-}" in
+  "") ;;
+  --check) check_only=true ;;
+  *)
+    echo "Usage: $(basename "$0") [--check]" >&2
+    exit 2
+    ;;
+esac
+
+if [[ -e $marker_file ]]; then
+  echo "Brave Wayland rollback was already applied."
+  exit 0
+fi
+
+if ! issue_payload="$(curl --fail --silent --show-error --location --connect-timeout 10 --max-time 30 \
+  --header 'Accept: application/vnd.github+json' \
+  --header 'User-Agent: brave-wayland-autofix' \
+  "$issue_api")"; then
+  echo "Could not check upstream issue #58528; keeping the workaround."
+  exit 0
+fi
+
+if ! issue_state="$(jq -er '.state' <<<"$issue_payload")"; then
+  echo "Upstream issue response was invalid; keeping the workaround."
+  exit 0
+fi
+
+if [[ $issue_state != closed ]]; then
+  echo "Upstream issue #58528 is still open; keeping the workaround."
+  exit 0
+fi
+
+installed_version="$(pacman -Q brave-bin | awk '{print $2}')"
+if (( $(vercmp "$installed_version" "$known_bad_version") <= 0 )); then
+  echo "Issue is closed, but Brave $installed_version is not newer than $known_bad_version; keeping the workaround."
+  exit 0
+fi
+
+if $check_only; then
+  echo "Issue is closed and Brave $installed_version is newer: rollback is ready."
+  exit 0
+fi
+
+mkdir -p "$state_dir"
+backup_dir="$state_dir/brave-wayland-autofix-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$backup_dir"
+
+for path in "$flags_file" "$wrapper_file" "$desktop_file"; do
+  if [[ -e $path ]]; then
+    cp -a -- "$path" "$backup_dir/"
+  fi
+done
+
+for temporary_flag in '--ozone-platform=x11' '--disable-accelerated-video-decode'; do
+  if [[ -f $flags_file ]] && grep -Fqx -- "$temporary_flag" "$flags_file"; then
+    temporary_file="$(mktemp "${flags_file}.XXXXXX")"
+    trap 'rm -f "$temporary_file"' EXIT
+    grep -Fvx -- "$temporary_flag" "$flags_file" >"$temporary_file"
+    mv -- "$temporary_file" "$flags_file"
+    trap - EXIT
+  fi
+done
+
+rm -f -- "$wrapper_file" "$desktop_file"
+if command -v update-desktop-database >/dev/null; then
+  update-desktop-database ${HOME}/.local/share/applications
+fi
+
+printf 'issue=58528\nversion=%s\nbackup=%s\n' "$installed_version" "$backup_dir" >"$marker_file"
+omarchy-notification-send -u normal -g '󰖟' \
+  'Brave native Wayland restored' \
+  "Removed temporary Brave Wayland playback workarounds after Brave $installed_version. Restart Brave to use them. A backup is in $backup_dir."

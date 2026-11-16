@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Save the desktop and let Brave exit cleanly before ending the session."""
+
+from __future__ import annotations
+
+import fcntl
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+VALID_ACTIONS = {"logout", "reboot", "shutdown"}
+BRAVE_EXIT_TIMEOUT_SECONDS = 30
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omarchy-session"
+LOG_FILE = STATE_DIR / "system-action.log"
+LOCK_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "omarchy-session-system-action.lock"
+AUTOSAVE_SERVICE = "omarchy-session-autosave.service"
+
+
+def notify(title: str, message: str, *, critical: bool = False) -> None:
+    command = ["notify-send"]
+    if critical:
+        command.extend(["-u", "critical"])
+    command.extend([title, message])
+    subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+def main_brave_processes() -> dict[int, list[str]]:
+    """Return Brave browser processes, excluding renderers and helpers."""
+    processes: dict[int, list[str]] = {}
+    for cmdline_path in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            raw = cmdline_path.read_bytes()
+            argv = [part.decode(errors="replace") for part in raw.split(b"\0") if part]
+            pid = int(cmdline_path.parent.name)
+            executable = (cmdline_path.parent / "exe").resolve()
+        except (OSError, ValueError):
+            continue
+        if not argv or executable.name != "brave":
+            continue
+        # Omarchy's Brave wrapper uses exec -a, so the browser process may put
+        # its full rendered command line in argv[0]. Search every field rather
+        # than assuming conventional argv boundaries.
+        if "--type=" in " ".join(argv):
+            continue
+        processes[pid] = argv
+    return processes
+
+
+def run_logged(command: list[str], log, *, timeout: int | None = None) -> int:
+    log.write(f"run: {' '.join(command)}\n")
+    log.flush()
+    try:
+        result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        log.write(f"timeout after {timeout}s: {' '.join(command)}\n")
+        log.flush()
+        return 124
+    return result.returncode
+
+
+def restore_autosave_service(log) -> None:
+    run_logged(["systemctl", "--user", "start", AUTOSAVE_SERVICE], log)
+
+
+def finish(action: str, log) -> int:
+    command = {
+        "logout": ["uwsm", "stop"],
+        "reboot": ["systemctl", "reboot", "--no-wall"],
+        "shutdown": ["systemctl", "poweroff", "--no-wall"],
+    }[action]
+    log.write(f"Brave exited cleanly; requesting {action}\n")
+    log.flush()
+    return subprocess.run(command, check=False).returncode
+
+
+def perform(action: str) -> int:
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_FILE.open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            notify("Session action already running", "A logout, reboot, or shutdown is already in progress")
+            return 1
+
+        with LOG_FILE.open("a") as log:
+            LOG_FILE.chmod(0o600)
+            log.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] requested {action}\n")
+
+            run_logged(["systemctl", "--user", "stop", AUTOSAVE_SERVICE], log)
+            save_result = run_logged(
+                [str(Path.home() / ".local/bin/omarchy-session"), "autosave"],
+                log,
+                timeout=30,
+            )
+            if save_result != 0:
+                log.write(f"Session save failed with status {save_result}; aborting {action}\n")
+                log.flush()
+                restore_autosave_service(log)
+                notify("Session action cancelled", "Could not save the current workspace", critical=True)
+                return 1
+
+            if action in {"reboot", "shutdown"}:
+                run_logged(["omarchy-state", "clear", "re*-required"], log)
+            subprocess.Popen(
+                ["omarchy-osd", "-i", action, "-m", action.title(), "-d", "5000"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            run_logged(["omarchy-hyprland-window-close-all"], log)
+
+            deadline = time.monotonic() + BRAVE_EXIT_TIMEOUT_SECONDS
+            while True:
+                brave = main_brave_processes()
+                if not brave:
+                    return finish(action, log)
+                if time.monotonic() >= deadline:
+                    pids = ", ".join(str(pid) for pid in sorted(brave))
+                    log.write(f"Brave still running after {BRAVE_EXIT_TIMEOUT_SECONDS}s (PIDs: {pids}); aborting {action}\n")
+                    log.flush()
+                    restore_autosave_service(log)
+                    notify(
+                        "Session action paused",
+                        "Brave did not close cleanly. Reopen it, resolve any close prompt, and try again.",
+                        critical=True,
+                    )
+                    return 1
+                time.sleep(0.25)
+
+
+def dry_run(action: str) -> int:
+    brave = main_brave_processes()
+    print(f"Would save the current session, close all windows, and request {action}.")
+    if brave:
+        print(f"Would wait up to {BRAVE_EXIT_TIMEOUT_SECONDS}s for Brave PIDs: {', '.join(map(str, sorted(brave)))}")
+    else:
+        print("No Brave browser process currently needs to be drained.")
+    return 0
+
+
+def main() -> int:
+    arguments = sys.argv[1:]
+    dry = "--dry-run" in arguments
+    arguments = [argument for argument in arguments if argument != "--dry-run"]
+    if len(arguments) != 1 or arguments[0] not in VALID_ACTIONS:
+        print(f"Usage: {Path(sys.argv[0]).name} [--dry-run] <logout|reboot|shutdown>", file=sys.stderr)
+        return 2
+    return dry_run(arguments[0]) if dry else perform(arguments[0])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

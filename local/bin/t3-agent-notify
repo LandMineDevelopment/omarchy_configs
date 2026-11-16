@@ -1,0 +1,109 @@
+#!/usr/bin/python3
+"""Send local desktop notifications for OpenCode and Codex agent events."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+
+def compact(value: object, limit: int = 120) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else f"{text[: limit - 1]}…"
+
+
+def workspace_name(value: object) -> str:
+    path = str(value or "").strip()
+    return Path(path).name if path else "T3 Code"
+
+
+def notification_details(arguments: list[str]) -> tuple[str, str] | None:
+    if arguments and arguments[0] == "--test":
+        return "Agent notifications enabled", "OpenCode and Codex completions will appear here."
+
+    if arguments and arguments[0] == "opencode":
+        title = compact(arguments[1] if len(arguments) > 1 else "Task complete")
+        workspace = workspace_name(arguments[2] if len(arguments) > 2 else "")
+        return "OpenCode task complete", f"{title} — {workspace}"
+
+    if arguments and arguments[0] in {"opencode-input", "opencode-permission"}:
+        title = compact(arguments[1] if len(arguments) > 1 else "OpenCode")
+        workspace = workspace_name(arguments[2] if len(arguments) > 2 else "")
+        detail = compact(arguments[3] if len(arguments) > 3 else title)
+        summary = (
+            "OpenCode needs your input"
+            if arguments[0] == "opencode-input"
+            else "OpenCode needs approval"
+        )
+        return summary, f"{detail} — {workspace}"
+
+    if not arguments:
+        return None
+
+    try:
+        payload = json.loads(arguments[0])
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    if payload.get("type") != "agent-turn-complete":
+        return None
+
+    return "Codex task complete", workspace_name(payload.get("cwd"))
+
+
+def is_t3_session() -> bool:
+    """T3 owns alerts for its chats; CLI hooks cannot observe task completion."""
+    if os.environ.get("T3_MCP_BEARER_TOKEN"):
+        return True
+    # Other providers do not all receive the MCP marker. The installed desktop
+    # app is an ancestor of its provider processes, including hook subprocesses.
+    pid = os.getppid()
+    seen: set[int] = set()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        try:
+            if Path(os.readlink(f"/proc/{pid}/exe")).name == "t3code":
+                return True
+            status = Path(f"/proc/{pid}/status").read_text()
+            pid = int(next(line.split()[1] for line in status.splitlines()
+                           if line.startswith("PPid:")))
+        except (OSError, StopIteration, ValueError):
+            break
+    return False
+
+
+def main() -> int:
+    if "--test" not in sys.argv[1:] and is_t3_session():
+        return 0
+    details = notification_details(sys.argv[1:])
+    if details is None:
+        return 0
+
+    summary, body = details
+    environment = os.environ.copy()
+    # T3 Code's AppImage prepends its bundled libraries. System notify-send
+    # must use the matching system libnotify instead.
+    environment.pop("LD_LIBRARY_PATH", None)
+    environment.pop("LD_PRELOAD", None)
+
+    completed = subprocess.run(
+        [
+            "/usr/bin/notify-send",
+            "--app-name=T3 Code",
+            "--icon=t3code-nightly",
+            "--urgency=normal",
+            "--expire-time=10000",
+            summary,
+            body,
+        ],
+        check=False,
+        env=environment,
+    )
+    return completed.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

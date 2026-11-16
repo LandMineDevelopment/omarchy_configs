@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+
+set -u
+
+sunshine_action="${1:-}"
+sunshine_state_root="${XDG_STATE_HOME:-$HOME/.local/state}"
+sunshine_state_dir="${sunshine_state_root}/sunshine-laptop-screen"
+sunshine_brightness_file="${sunshine_state_dir}/brightness"
+sunshine_restore_idle_marker="${sunshine_state_dir}/restore-idle"
+sunshine_active_marker="${sunshine_state_dir}/active"
+
+start_stream() {
+  if [[ -e "${sunshine_active_marker}" ]]; then
+    exit 0
+  fi
+
+  mkdir -p -- "${sunshine_state_dir}"
+  chmod 700 -- "${sunshine_state_dir}"
+
+  if ! brightnessctl get >"${sunshine_brightness_file}"; then
+    rmdir --ignore-fail-on-non-empty -- "${sunshine_state_dir}"
+    return 1
+  fi
+
+  sunshine_idle_status="$(omarchy-shell idle status 2>/dev/null)" || {
+    rm -f -- "${sunshine_brightness_file}"
+    rmdir --ignore-fail-on-non-empty -- "${sunshine_state_dir}"
+    return 1
+  }
+
+  if jq -e '.stayAwake == false' >/dev/null <<<"${sunshine_idle_status}"; then
+    touch -- "${sunshine_restore_idle_marker}"
+    if ! omarchy-shell idle disable >/dev/null; then
+      rm -f -- "${sunshine_restore_idle_marker}" "${sunshine_brightness_file}"
+      rmdir --ignore-fail-on-non-empty -- "${sunshine_state_dir}"
+      return 1
+    fi
+  fi
+
+  if ! brightnessctl -q set 0; then
+    if [[ -e "${sunshine_restore_idle_marker}" ]]; then
+      omarchy-shell idle enable >/dev/null 2>&1 || true
+    fi
+    rm -f -- "${sunshine_restore_idle_marker}" "${sunshine_brightness_file}"
+    rmdir --ignore-fail-on-non-empty -- "${sunshine_state_dir}"
+    return 1
+  fi
+
+  touch -- "${sunshine_active_marker}"
+}
+
+stop_stream() {
+  sunshine_stop_status=0
+
+  if [[ -s "${sunshine_brightness_file}" ]]; then
+    sunshine_saved_brightness="$(<"${sunshine_brightness_file}")"
+    brightnessctl -q set "${sunshine_saved_brightness}" || sunshine_stop_status=1
+  fi
+
+  if [[ -e "${sunshine_restore_idle_marker}" ]]; then
+    omarchy-shell idle enable >/dev/null || sunshine_stop_status=1
+  fi
+
+  rm -f -- \
+    "${sunshine_active_marker}" \
+    "${sunshine_restore_idle_marker}" \
+    "${sunshine_brightness_file}"
+  rmdir --ignore-fail-on-non-empty -- "${sunshine_state_dir}"
+
+  return "${sunshine_stop_status}"
+}
+
+case "${sunshine_action}" in
+  start)
+    start_stream
+    ;;
+  stop)
+    stop_stream
+    ;;
+  *)
+    echo "Usage: ${0##*/} {start|stop}" >&2
+    exit 2
+    ;;
+esac

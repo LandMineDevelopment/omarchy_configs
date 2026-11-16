@@ -1,0 +1,54 @@
+{
+  "manifest_version": 3,
+  "name": "Brave Media Transparency Trial",
+  "version": "0.2.54",
+  "description": "Global media-aware transparency toggle. Images and videos are protected where supported.",
+  "permissions": [
+    "tabs",
+    "scripting",
+    "nativeMessaging",
+    "storage"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Turn media-aware transparency on or off globally"
+  },
+  "chrome_url_overrides": {
+    "newtab": "newtab.html"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArvH2sFvIFUQCOalfymch1C711zg6aSG/pBzCAloRDpbupJHg+LGWQimwx/R5nOGQzva39SVDYw3X14Qw1BW4kJGFig4WS5QO5a1pBUPiZj71V306a8fWx6gbVH6aLvoy1ttOsqp6hGyTE7Ui/oG9orJMZPW63WgWeIrBuDdqEf4bC4R9zubZi4bQIa4qXQT2glgFxtlF4vPM4du8Wk1/vlQnLxmSBEz36nbAtrjUgSgPInnn9uIcK8qendVFDFu/Ha19gzLP46fFMXjiue7TOWQ0NJiN1kMgAjG+pr+ICZ2rD53FKvtkdo5AqhUNY5ijTMPPzuxcG9wvjOY8LqSfzwIDAQAB",
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "canvas-context.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "geometry.js",
+        "media.js",
+        "vendor/darkreader.js",
+        "theme.js",
+        "content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ]
+}

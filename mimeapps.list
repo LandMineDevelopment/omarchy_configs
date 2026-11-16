@@ -49,7 +49,9 @@ application/x-synology-drive-sheet=synology-drive-open-file.desktop
 application/x-synology-drive-slides=synology-drive-open-file.desktop
 x-scheme-handler/aether=aether-protocol-handler.desktop
 inode/directory=org.gnome.Nautilus.desktop
-x-scheme-handler/t3code=t3code-url-handler.desktop
+x-scheme-handler/t3code=com.t3tools.T3Code.desktop
+x-scheme-handler/codex=chatgpt.desktop
+x-scheme-handler/superwhisper=superwhisper-url.desktop
 
 [Added Associations]
 application/octet-stream=mpv.desktop;

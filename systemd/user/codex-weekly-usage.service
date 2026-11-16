@@ -1,0 +1,9 @@
+[Unit]
+Description=Refresh Codex weekly usage for the Omarchy bar
+
+[Service]
+Type=oneshot
+Environment=OMARCHY_PATH=/usr/share/omarchy
+ExecStart=/usr/bin/omarchy-agent-usage-update --limits-only codex
+TimeoutStartSec=50
+

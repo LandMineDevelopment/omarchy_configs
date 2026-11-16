@@ -1,13 +1,10 @@
-# Portable tools used by the tracked configuration. bootstrap.sh can install
-# missing entries with: ./bootstrap.sh --install-packages
-alacritty
+# Portable requirements of the tracked configuration, shared by both profiles.
+# This is a curated manifest, not a dump of every dependency on this machine.
 btop
 fcitx5
 ghostty
 herdr
-kitty
 lazygit
-mise
 neovim
 nnn
 starship
@@ -17,4 +14,3 @@ wl-clipboard
 xorg-xrdb
 xterm
 yazi
-ttf-jetbrains-mono-nerd

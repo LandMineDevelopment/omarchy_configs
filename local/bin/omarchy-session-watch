@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Autosave an Omarchy session after meaningful Hyprland state changes."""
+
+import hashlib
+import json
+import os
+import selectors
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+DEBOUNCE_SECONDS = 3.0
+SAVE_EVENTS = {
+    "activewindowv2",
+    "workspacev2",
+    "activespecialv2",
+    "openwindow",
+    "closewindow",
+    "kill",
+    "movewindowv2",
+    "fullscreen",
+    "changefloatingmode",
+    "windowtitlev2",
+    "togglegroup",
+    "moveintogroup",
+    "moveoutofgroup",
+    "moveworkspacev2",
+    "renameworkspace",
+    "monitoraddedv2",
+    "monitorremovedv2",
+}
+
+
+def event_requires_save(event: str) -> bool:
+    return event.partition(">>")[0] in SAVE_EVENTS
+
+
+def hypr_json(command: str):
+    try:
+        result = subprocess.run(
+            ["hyprctl", command, "-j"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        return json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+
+
+def semantic_fingerprint() -> str | None:
+    clients = hypr_json("clients")
+    active = hypr_json("activewindow")
+    if not isinstance(clients, list) or not isinstance(active, dict):
+        return None
+
+    projected_clients = []
+    for client in clients:
+        projected_clients.append(
+            {
+                "address": client.get("address"),
+                "class": client.get("class"),
+                "initialClass": client.get("initialClass"),
+                "title": client.get("title"),
+                "initialTitle": client.get("initialTitle"),
+                "workspace": client.get("workspace"),
+                "monitor": client.get("monitor"),
+                "grouped": client.get("grouped"),
+                "floating": client.get("floating"),
+                "fullscreen": client.get("fullscreen"),
+                "size": client.get("size"),
+                "at": client.get("at"),
+                "pinned": client.get("pinned"),
+            }
+        )
+    projected_clients.sort(key=lambda client: client.get("address") or "")
+
+    state = {
+        "clients": projected_clients,
+        "active": {
+            "address": active.get("address"),
+            "class": active.get("class"),
+            "title": active.get("title"),
+            "workspace": active.get("workspace"),
+            "grouped": active.get("grouped"),
+        },
+    }
+    encoded = json.dumps(state, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def save_session() -> bool:
+    command = Path.home() / ".local/bin/omarchy-session"
+    result = subprocess.run([str(command), "autosave"], check=False)
+    return result.returncode == 0
+
+
+def socket_path() -> Path:
+    override = os.environ.get("OMARCHY_SESSION_EVENT_SOCKET")
+    if override:
+        return Path(override)
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not runtime or not signature:
+        raise RuntimeError("Hyprland session environment is unavailable")
+    return Path(runtime) / "hypr" / signature / ".socket2.sock"
+
+
+def watch() -> int:
+    path = socket_path()
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        connection.connect(str(path))
+    except OSError as error:
+        print(f"Unable to connect to Hyprland event socket {path}: {error}", file=sys.stderr)
+        return 1
+
+    connection.setblocking(False)
+    selector = selectors.DefaultSelector()
+    selector.register(connection, selectors.EVENT_READ)
+    buffer = b""
+    deadline: float | None = None
+    last_fingerprint = semantic_fingerprint()
+    print(f"Watching Hyprland session changes on {path}", flush=True)
+
+    try:
+        while True:
+            timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+            ready = selector.select(timeout)
+
+            if ready:
+                chunk = connection.recv(65536)
+                if not chunk:
+                    print("Hyprland event socket disconnected", file=sys.stderr)
+                    return 1
+                buffer += chunk
+                while b"\n" in buffer:
+                    raw_event, buffer = buffer.split(b"\n", 1)
+                    event = raw_event.decode(errors="replace")
+                    if event_requires_save(event):
+                        deadline = time.monotonic() + DEBOUNCE_SECONDS
+                continue
+
+            if deadline is None or time.monotonic() < deadline:
+                continue
+
+            deadline = None
+            fingerprint = semantic_fingerprint()
+            if fingerprint is None or fingerprint == last_fingerprint:
+                continue
+            if save_session():
+                last_fingerprint = fingerprint
+    finally:
+        selector.close()
+        connection.close()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(watch())
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as error:
+        print(f"Omarchy session watcher failed: {error}", file=sys.stderr)
+        raise SystemExit(1)

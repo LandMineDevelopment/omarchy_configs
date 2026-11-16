@@ -48,3 +48,19 @@
 --     column_width = 0.97,
 --   },
 -- })
+
+-- Keep T3 text opaque; the local launcher supplies background transparency.
+o.window("com\\.t3tools\\.T3Code", {
+  opacity = "1 override 1 override 1 override",
+})
+
+-- The media-aware shader owns Brave background transparency in every focus state.
+-- Keep text and media at full opacity instead of fading the whole inactive pane.
+o.window("^brave-browser$", {
+  opacity = "1 override 1 override 1 override",
+})
+
+-- Opt another application in to Omarchy's standard transparency.
+-- Find its class with: hyprctl clients
+-- o.transparent_window("my-app")
+-- o.transparent_window("my-app", "0.9 0.85") -- Custom active/inactive opacity.

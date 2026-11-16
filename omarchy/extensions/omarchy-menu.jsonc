@@ -27,4 +27,13 @@
   // Example: replace the default About action by reusing the same id. Existing
   // fields are kept unless overridden.
   // "about": {"icon":"","label":"About","action":"omarchy-launch-or-focus-tui \"zsh -c 'fastfetch; read -k 1'\""},
+
+  // Preserve browser sessions by waiting for Brave to exit cleanly before
+  // ending the graphical session. The stock actions use a fixed two-second
+  // deadline, which can leave Chromium's profile marked as crashed. Keep the
+  // stock presentation fields here because Omarchy currently normalizes
+  // omitted extension fields before merging them with the default entries.
+  "system.logout": {"icon":"󰍃","label":"Logout","action":"$HOME/.local/bin/omarchy-session-system-action logout"},
+  "system.reboot": {"icon":"󰜉","label":"Reboot","action":"$HOME/.local/bin/omarchy-session-system-action reboot"},
+  "system.shutdown": {"icon":"󰐥","label":"Shutdown","action":"$HOME/.local/bin/omarchy-session-system-action shutdown"},
 }

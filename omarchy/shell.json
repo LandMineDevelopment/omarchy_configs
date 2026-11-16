@@ -1,25 +1,12 @@
 {
   "bar": {
-    "centerAnchor": "omarchy.clock",
     "layout": {
       "center": [
         {
-          "id": "omarchy.indicators"
-        },
-        {
-          "format": "dddd HH:mm",
-          "formatAlt": "d MMMM 'W'ww yyyy",
           "id": "omarchy.clock",
+          "format": "yyyy-MM-dd HH:mm",
+          "formatAlt": "d MMMM 'W'ww yyyy",
           "verticalFormat": "HH\n—\nmm"
-        },
-        {
-          "id": "omarchy.keyboard-layout"
-        },
-        {
-          "id": "omarchy.weather"
-        },
-        {
-          "id": "omarchy.system-update"
         }
       ],
       "left": [
@@ -28,6 +15,9 @@
         },
         {
           "id": "omarchy.workspaces"
+        },
+        {
+          "id": "kasey.codex-weekly"
         }
       ],
       "right": [
@@ -35,13 +25,19 @@
           "id": "omarchy.tray"
         },
         {
+          "id": "omarchy.keyboard-layout"
+        },
+        {
+          "id": "omarchy.tailscale"
+        },
+        {
           "id": "omarchy.agents"
         },
         {
-          "id": "omarchy.bluetooth"
+          "id": "omarchy.network"
         },
         {
-          "id": "omarchy.network"
+          "id": "omarchy.bluetooth"
         },
         {
           "id": "omarchy.audio"
@@ -52,15 +48,68 @@
         {
           "id": "omarchy.power"
         }
+      ],
+      "centerBegin": [
+        {
+          "id": "omarchy.indicators"
+        }
+      ],
+      "centerEnd": [
+        {
+          "id": "omarchy.elsewhen",
+          "cities": [
+            {
+              "name": "Eastern",
+              "zone": "US/Eastern"
+            },
+            {
+              "name": "London",
+              "zone": "Europe/London"
+            },
+            {
+              "name": "Dubai",
+              "zone": "Asia/Dubai"
+            },
+            {
+              "name": "Tokyo",
+              "zone": "Asia/Tokyo"
+            },
+            {
+              "name": "Los Angeles",
+              "zone": "America/Los_Angeles"
+            }
+          ]
+        },
+        {
+          "id": "omarchy.weather"
+        },
+        {
+          "id": "omarchy.system-update"
+        }
+      ],
+      "tray": [
+        {
+          "id": "superwhisper.panel"
+        }
       ]
     },
     "position": "top",
     "transparent": false
   },
   "idle": {
-    "lock": 300,
-    "screensaver": 150
+    "lock": 900,
+    "screensaver": 600
   },
-  "plugins": [],
-  "version": 1
+  "plugins": [
+    {
+      "id": "kasey.idle"
+    }
+  ],
+  "version": 1,
+  "disabledPlugins": [
+    "omarchy.idle"
+  ],
+  "cloneSourceRestores": [
+    "kasey.idle"
+  ]
 }

@@ -24,7 +24,7 @@ mapfile -t component_names < <(
 
 while IFS= read -r -d '' tracked_path; do
   case "$tracked_path" in
-    .gitignore|README.md|bootstrap.sh|components.conf|configctl|lib/*|packages.txt|profiles/*/packages.txt|tests/*) continue ;;
+    .gitignore|README.md|CUSTOM-SETUP.md|bootstrap.sh|components.conf|configctl|lib/*|packages.txt|profiles/*/packages.txt|profiles/*/installed-software.md|tests/*) continue ;;
   esac
 
   owners=0

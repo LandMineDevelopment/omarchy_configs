@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Workspace Sessions
+Comment=Save, restore, preview, and undo Hyprland workspace sessions
+Exec=omarchy-session menu
+Icon=omarchy-session
+Terminal=false
+Categories=Utility;
+Keywords=workspace;session;save;restore;hyprland;
+X-Omarchy-Session-Managed=true

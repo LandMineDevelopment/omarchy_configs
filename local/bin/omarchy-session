@@ -1,0 +1,3631 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Ben U
+# SPDX-License-Identifier: GPL-3.0-or-later
+import configparser
+import json
+import os
+import re
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse
+
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "omarchy-session"
+SESSION_FILE = STATE_DIR / "last-session.json"
+UNDO_FILE = STATE_DIR / "before-last-restore.json"
+LAST_RESTORE_FILE = STATE_DIR / "last-restore.json"
+LAST_RESTORE_AUDIT_FILE = STATE_DIR / "last-restore-audit.json"
+UNKNOWN_CLASSES_FILE = STATE_DIR / "unknown-classes.json"
+AUTOSAVE_DIR = STATE_DIR / "autosaves"
+LATEST_AUTOSAVE = AUTOSAVE_DIR / "latest.json"
+PROFILE_DIR = STATE_DIR / "profiles"
+AUTOSAVE_KEEP = 48
+PI_SESSION_ROOT = Path.home() / ".pi/agent/sessions"
+CLAUDE_PROJECT_ROOT = Path.home() / ".claude/projects"
+CODEX_SESSION_ROOT = Path.home() / ".codex/sessions"
+OPENCODE_DB = Path.home() / ".local/share/opencode/opencode.db"
+AGENT_REGISTRY_DIRNAME = "omarchy-session/agents"
+PI_REGISTRY_EXTENSION = Path.home() / ".pi/agent/extensions/omarchy-session-registry.ts"
+CLAUDE_REGISTRY_HOOK = Path.home() / ".local/lib/omarchy-session/claude-session-registry.py"
+OPENCODE_REGISTRY_PLUGIN = Path.home() / ".config/opencode/plugins/omarchy-session-registry.ts"
+MAKE_RESTORE_TARGETS = {"ssh", "pi", "claude", "codex", "opencode"}
+DIRECT_RESTORE_COMMANDS = {"ssh", "tmux", "nvim", "vim", "vi", "claude", "codex", "opencode"}
+EXCLUDED_CLASSES = {"zenity", "pinentry", "org.gnome.polkit", "xdg-desktop-portal"}
+CHROMIUM_BROWSER_CLASSES = {
+    "chromium", "chromium-browser", "brave-browser", "brave",
+    "google-chrome", "google-chrome-stable",
+}
+FIREFOX_BROWSER_CLASSES = {
+    "firefox", "firefoxdeveloperedition",
+    "zen", "zen-browser", "zen-twilight", "app.zen_browser.zen",
+}
+BROWSER_CLASSES = CHROMIUM_BROWSER_CLASSES | FIREFOX_BROWSER_CLASSES
+SINGLETON_CLASSES = {
+    *BROWSER_CLASSES,
+    "slack", "discord", "signal", "signal-desktop", "obsidian", "thunderbird", "keepassxc",
+    "org.keepassxc.keepassxc", "telegram-desktop", "org.telegram.desktop",
+}
+TERMINAL_CLASSES = {"com.mitchellh.ghostty", "ghostty", "alacritty"}
+REQUIRED_COMMANDS = ("hyprctl",)
+VERBOSE = False
+
+OPTIONAL_COMMAND_GROUPS = {
+    "terminal restore": ("ghostty", "alacritty"),
+    "notifications/session supervision": ("notify-send", "uwsm"),
+    "pick menu": ("walker", "wofi", "fuzzel", "rofi"),
+    "web apps": ("omarchy-launch-webapp",),
+    "app restore targets": (
+        "chromium", "brave", "google-chrome-stable", "firefox", "zen-browser", "obsidian", "slack",
+        "discord", "signal-desktop", "Telegram", "telegram-desktop", "nautilus", "thunderbird", "keepassxc", "code",
+    ),
+    "agent resume helpers": ("pi", "claude", "codex", "opencode"),
+}
+
+
+def notify(title: str, body: str = "") -> None:
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", title, body], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def require(cmd: str) -> None:
+    if not shutil.which(cmd):
+        print(f"Missing required command: {cmd}", file=sys.stderr)
+        sys.exit(1)
+
+
+def dependency_status() -> None:
+    print("Omarchy session dependencies")
+    print(f"  python: {sys.version.split()[0]} ({sys.executable})")
+
+    missing_required = []
+    for cmd in REQUIRED_COMMANDS:
+        path = shutil.which(cmd)
+        if path:
+            print(f"  required: {cmd:<24} ok ({path})")
+        else:
+            print(f"  required: {cmd:<24} missing")
+            missing_required.append(cmd)
+
+    for group, commands in OPTIONAL_COMMAND_GROUPS.items():
+        present = [cmd for cmd in commands if shutil.which(cmd)]
+        missing = [cmd for cmd in commands if not shutil.which(cmd)]
+        present_text = ", ".join(present) if present else "none"
+        missing_text = ", ".join(missing) if missing else "none"
+        print(f"  optional: {group:<24} present: {present_text}; missing: {missing_text}")
+
+    integrations = {
+        "Pi exact-session extension": PI_REGISTRY_EXTENSION.exists(),
+        "Claude exact-session hook": CLAUDE_REGISTRY_HOOK.exists(),
+        "Codex PID/thread logs": (Path.home() / ".codex/logs_2.sqlite").exists(),
+        "OpenCode exact-session plugin": OPENCODE_REGISTRY_PLUGIN.exists(),
+    }
+    for name, installed in integrations.items():
+        print(f"  integration: {name:<27} {'installed' if installed else 'not installed'}")
+
+    if missing_required:
+        print("\nMissing required commands prevent save/restore from reading Hyprland state.", file=sys.stderr)
+        sys.exit(1)
+
+
+def read_proc_argv(pid: int) -> list[str]:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        return [part.decode(errors="replace") for part in raw.split(b"\0") if part]
+    except Exception:
+        return []
+
+
+def read_proc_environ(pid: int) -> dict[str, str]:
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except Exception:
+        return {}
+    env: dict[str, str] = {}
+    for part in raw.split(b"\0"):
+        if b"=" not in part:
+            continue
+        key, value = part.split(b"=", 1)
+        env[key.decode(errors="replace")] = value.decode(errors="replace")
+    return env
+
+
+def read_proc_cwd(pid: int) -> str:
+    try:
+        return str(Path(f"/proc/{pid}/cwd").resolve())
+    except Exception:
+        return ""
+
+
+def proc_info(pid: int) -> tuple[str, str, str, list[str]]:
+    cwd = ""
+    cmdline = ""
+    workdir = ""
+    argv: list[str] = []
+
+    cwd = read_proc_cwd(pid)
+    argv = read_proc_argv(pid)
+    cmdline = " ".join(shlex.quote(part) for part in argv)
+
+    parts = argv or shlex.split(cmdline)
+    for i, part in enumerate(parts):
+        if part.startswith("--working-directory="):
+            workdir = part.split("=", 1)[1]
+            break
+        if part == "--working-directory" and i + 1 < len(parts):
+            workdir = parts[i + 1]
+            break
+
+    workdir = workdir.strip("'\"") or cwd
+    return cwd, cmdline, workdir, argv
+
+
+def child_map() -> dict[int, list[int]]:
+    children: dict[int, list[int]] = {}
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            pid = int(proc.name)
+            for line in (proc / "status").read_text(errors="ignore").splitlines():
+                if line.startswith("PPid:"):
+                    ppid = int(line.split()[1])
+                    children.setdefault(ppid, []).append(pid)
+                    break
+        except Exception:
+            continue
+    return children
+
+
+def descendants(pid: int, children: dict[int, list[int]]) -> list[tuple[int, int]]:
+    found: list[tuple[int, int]] = []
+    stack = [(child, 1) for child in children.get(pid, [])]
+    while stack:
+        child, depth = stack.pop()
+        found.append((child, depth))
+        stack.extend((grandchild, depth + 1) for grandchild in children.get(child, []))
+    return found
+
+
+def pi_session_dir_for_cwd(cwd: str) -> Path:
+    encoded = "--" + cwd.strip("/").replace("/", "-") + "--"
+    return PI_SESSION_ROOT / encoded
+
+
+def pi_sessions_for_cwd(cwd: str) -> list[str]:
+    session_dir = pi_session_dir_for_cwd(cwd)
+    try:
+        sessions = [p for p in session_dir.glob("*.jsonl") if p.is_file()]
+    except Exception:
+        return []
+    return [str(p) for p in sorted(sessions, key=lambda p: p.stat().st_mtime, reverse=True)]
+
+
+def all_pi_sessions() -> list[str]:
+    if not PI_SESSION_ROOT.exists():
+        return []
+    sessions: list[Path] = []
+    try:
+        session_dirs = [p for p in PI_SESSION_ROOT.iterdir() if p.is_dir()]
+    except Exception:
+        return []
+    for session_dir in session_dirs:
+        try:
+            sessions.extend(p for p in session_dir.glob("*.jsonl") if p.is_file())
+        except Exception:
+            continue
+    return [str(p) for p in sorted(sessions, key=lambda p: p.stat().st_mtime, reverse=True)]
+
+
+def pi_session_id(session: str) -> str:
+    path = Path(session)
+    try:
+        with path.open(errors="ignore") as handle:
+            first = handle.readline()
+        meta = json.loads(first)
+        session_id = meta.get("id") or (meta.get("payload") or {}).get("id") or ""
+        if session_id:
+            return str(session_id)
+    except Exception:
+        pass
+    stem = path.stem
+    if "_" in stem:
+        return stem.rsplit("_", 1)[1]
+    return stem
+
+
+def resolve_pi_session_arg(session_arg: str, cwd: str) -> str:
+    if not session_arg:
+        return ""
+    if "/" in session_arg or "\\" in session_arg or session_arg.endswith(".jsonl"):
+        path = Path(session_arg).expanduser()
+        if not path.is_absolute():
+            path = Path(cwd) / path
+        try:
+            path = path.resolve()
+        except Exception:
+            path = path.absolute()
+        return str(path) if path.is_file() else ""
+
+    local_sessions = pi_sessions_for_cwd(cwd)
+    for session in local_sessions:
+        if pi_session_id(session) == session_arg:
+            return session
+    for session in local_sessions:
+        if pi_session_id(session).startswith(session_arg):
+            return session
+
+    global_sessions = all_pi_sessions()
+    for session in global_sessions:
+        if pi_session_id(session) == session_arg:
+            return session
+    for session in global_sessions:
+        if pi_session_id(session).startswith(session_arg):
+            return session
+    return ""
+
+
+def explicit_pi_session_from_argv(argv: list[str], cwd: str) -> str:
+    args = command_tail(argv, "pi")
+    session_arg = option_value(args, {"--session", "--session-id"})
+    return resolve_pi_session_arg(session_arg, cwd) if session_arg else ""
+
+
+def argv_invokes_pi(argv: list[str]) -> bool:
+    return any(Path(arg).name == "pi" for arg in argv)
+
+
+def argv_has_pi_continue(argv: list[str]) -> bool:
+    for i, arg in enumerate(argv):
+        if Path(arg).name == "pi":
+            return any(part in {"--continue", "-c"} for part in argv[i + 1:])
+    return False
+
+
+def proc_start_ticks(pid: int) -> int:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(errors="ignore")
+        return int(stat.rsplit(") ", 1)[1].split()[19])
+    except Exception:
+        return 0
+
+
+def agent_registry_root(env: dict[str, str] | None = None) -> Path:
+    env = env or os.environ
+    runtime_dir = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return Path(runtime_dir) / AGENT_REGISTRY_DIRNAME
+
+
+def agent_registry_record(tool: str, pid: int, env: dict[str, str] | None = None) -> dict:
+    path = agent_registry_root(env) / tool / f"{pid}.json"
+    try:
+        record = json.loads(path.read_text())
+    except Exception:
+        return {}
+    if record.get("tool") != tool or record.get("pid") != pid:
+        return {}
+    saved_ticks = int(record.get("processStartTicks") or 0)
+    if not saved_ticks or saved_ticks != proc_start_ticks(pid):
+        return {}
+    session_id = record.get("sessionId") or ""
+    if not session_id:
+        return {}
+    return record
+
+
+def timestamp_epoch(value) -> float:
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number / 1000 if number > 10_000_000_000 else number
+    if not isinstance(value, str) or not value:
+        return 0
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0
+
+
+def command_tail(argv: list[str], command: str) -> list[str]:
+    for i, arg in enumerate(argv):
+        if Path(arg).name == command:
+            return argv[i + 1:]
+    return []
+
+
+def option_value(args: list[str], names: set[str]) -> str:
+    for i, arg in enumerate(args):
+        if arg in names and i + 1 < len(args) and not args[i + 1].startswith("-"):
+            return args[i + 1]
+        for name in names:
+            if arg.startswith(name + "="):
+                return arg.split("=", 1)[1]
+    return ""
+
+
+def explicit_claude_session_from_argv(argv: list[str]) -> str:
+    args = command_tail(argv, "claude")
+    return option_value(args, {"--resume", "-r", "--session-id"})
+
+
+def claude_project_root_from_env(env: dict[str, str]) -> Path:
+    config_dir = env.get("CLAUDE_CONFIG_DIR") or ""
+    if config_dir:
+        return Path(config_dir) / "projects"
+    return CLAUDE_PROJECT_ROOT
+
+
+def restore_launcher_from_env(env: dict[str, str], keys: tuple[str, ...], default: str) -> str:
+    """Return a safe executable name advertised by a user wrapper."""
+    for key in keys:
+        launcher = (env.get(key) or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", launcher) and shutil.which(launcher):
+            return launcher
+    return default
+
+
+def pi_command_from_env(env: dict[str, str]) -> str:
+    return restore_launcher_from_env(env, ("OMARCHY_SESSION_PI_COMMAND",), "pi")
+
+
+def claude_command_from_env(env: dict[str, str]) -> str:
+    return restore_launcher_from_env(
+        env,
+        ("OMARCHY_SESSION_CLAUDE_COMMAND", "CLAUDE_LAUNCHER"),
+        "claude",
+    )
+
+
+def codex_command_from_process(_argv: list[str], env: dict[str, str]) -> str:
+    """Recover the user-facing Codex launcher after a wrapper execs the CLI."""
+    return restore_launcher_from_env(
+        env,
+        ("OMARCHY_SESSION_CODEX_COMMAND", "CODEX_LAUNCHER"),
+        "codex",
+    )
+
+
+def opencode_command_from_env(env: dict[str, str]) -> str:
+    return restore_launcher_from_env(env, ("OMARCHY_SESSION_OPENCODE_COMMAND",), "opencode")
+
+
+def codex_session_root_from_env(env: dict[str, str]) -> Path:
+    codex_home = env.get("CODEX_HOME") or ""
+    return Path(codex_home).expanduser() / "sessions" if codex_home else CODEX_SESSION_ROOT
+
+
+def codex_log_db_from_env(env: dict[str, str]) -> Path:
+    codex_home = env.get("CODEX_HOME") or str(Path.home() / ".codex")
+    return Path(codex_home).expanduser() / "logs_2.sqlite"
+
+
+def codex_session_from_process_logs(pid: int, cwd: str, env: dict[str, str]) -> str:
+    """Read Codex's authoritative PID-to-thread mapping from its log database."""
+    db_path = codex_log_db_from_env(env)
+    if not db_path.exists():
+        return ""
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        rows = conn.execute(
+            """
+            select thread_id from logs
+            where process_uuid like ? and thread_id is not null
+            group by thread_id
+            order by max(id) desc
+            """,
+            (f"pid:{pid}:%",),
+        ).fetchall()
+    except Exception:
+        return ""
+    finally:
+        if conn is not None:
+            conn.close()
+
+    session_root = codex_session_root_from_env(env)
+    top_level = {session_id for _, session_id, _ in codex_sessions_for_cwd(cwd, session_root)}
+    return next((thread_id for (thread_id,) in rows if thread_id in top_level), "")
+
+
+def codex_session_metadata(path: Path) -> tuple[str, str, float] | None:
+    try:
+        with path.open(errors="ignore") as handle:
+            meta = json.loads(handle.readline())
+        payload = meta.get("payload") or {}
+        source = payload.get("source") or {}
+        if payload.get("thread_source") == "subagent" or (
+            isinstance(source, dict) and source.get("subagent")
+        ):
+            return None
+        session_id = payload.get("id") or payload.get("session_id") or ""
+        cwd = payload.get("cwd") or ""
+        created = timestamp_epoch(payload.get("timestamp") or meta.get("timestamp"))
+        return (str(session_id), cwd, created) if session_id and cwd else None
+    except Exception:
+        return None
+
+
+def codex_sessions_for_cwd(cwd: str, session_root: Path = CODEX_SESSION_ROOT) -> list[tuple[Path, str, float]]:
+    try:
+        paths = [p for p in session_root.rglob("*.jsonl") if p.is_file()]
+    except Exception:
+        return []
+    sessions: list[tuple[Path, str, float]] = []
+    for path in paths:
+        metadata = codex_session_metadata(path)
+        if metadata and metadata[1] == cwd:
+            sessions.append((path, metadata[0], metadata[2]))
+    sessions.sort(key=lambda item: item[0].stat().st_mtime, reverse=True)
+    return sessions
+
+
+def explicit_codex_session_from_argv(argv: list[str]) -> str:
+    args = command_tail(argv, "codex")
+    for i, arg in enumerate(args):
+        if arg in {"resume", "fork"} and i + 1 < len(args) and not args[i + 1].startswith("-"):
+            return args[i + 1]
+    return ""
+
+
+def opencode_db_from_env(env: dict[str, str]) -> Path:
+    data_home = env.get("XDG_DATA_HOME") or ""
+    return Path(data_home).expanduser() / "opencode/opencode.db" if data_home else OPENCODE_DB
+
+
+def explicit_opencode_session_from_argv(argv: list[str]) -> str:
+    return option_value(command_tail(argv, "opencode"), {"--session", "-s"})
+
+
+def make_restore_argv(argv: list[str]) -> list[str]:
+    if not argv or Path(argv[0]).name not in {"make", "gmake"}:
+        return []
+    for arg in argv[1:]:
+        if arg.startswith("-") or "=" in arg:
+            continue
+        if arg in MAKE_RESTORE_TARGETS:
+            return argv
+    return []
+
+
+def safe_terminal_restore_argv(argv: list[str]) -> list[str]:
+    if not argv:
+        return []
+    exe = Path(argv[0]).name
+    if exe == "nvim":
+        # Embedded Neovim is an RPC backend whose UI is supplied by its parent.
+        # Replaying the child command alone leaves a blank terminal, so restore
+        # it as a normal interactive Neovim while preserving all other args.
+        return [arg for arg in argv if arg != "--embed"]
+    return argv
+
+
+def terminal_child_state(pid: int, fallback: str, children: dict[int, list[int]], used_sessions: dict[str, set[str]]) -> tuple[str, list[str], dict]:
+    home = str(Path.home())
+    best = (0, fallback)
+    restore_argv: list[str] = []
+    restore_session: dict = {}
+    kids = sorted(descendants(pid, children), key=lambda item: item[1])
+
+    # Integrations publish authoritative PID-to-session records. Prefer those
+    # over argv parsing and never replace them with cwd/time-based guesses.
+    for child_pid, depth in kids:
+        env = read_proc_environ(child_pid)
+        process_cwd = read_proc_cwd(child_pid) or fallback
+        for tool in ("pi", "claude", "opencode"):
+            record = agent_registry_record(tool, child_pid, env)
+            if not record:
+                continue
+            workdir = record.get("cwd") or process_cwd
+            session_id = record.get("sessionId") or ""
+            if tool == "pi":
+                session_file = record.get("sessionFile") or ""
+                if not session_file or not Path(session_file).is_file():
+                    continue
+                command = pi_command_from_env(env)
+                used_sessions.setdefault("pi", set()).add(session_file)
+                return workdir, [command, "--session", session_file], {
+                    "tool": "pi", "id": session_id, "path": session_file,
+                    "command": command, "match": "pid-registry",
+                }
+            if tool == "claude":
+                command = claude_command_from_env(env)
+                project_root = claude_project_root_from_env(env)
+                used_sessions.setdefault(f"claude:{project_root}", set()).add(session_id)
+                return workdir, [command, "--resume", session_id], {
+                    "tool": "claude", "id": session_id, "command": command,
+                    "projectRoot": str(project_root), "match": "pid-registry",
+                }
+            if tool == "opencode":
+                command = opencode_command_from_env(env)
+                db_path = opencode_db_from_env(env)
+                used_sessions.setdefault(f"opencode:{db_path}", set()).add(session_id)
+                quoted_command = shlex.quote(command)
+                cmd = f"{quoted_command} --session {shlex.quote(session_id)} || {quoted_command}"
+                return workdir, ["sh", "-lc", cmd], {
+                    "tool": "opencode", "id": session_id, "command": command,
+                    "database": str(db_path), "match": "pid-registry",
+                }
+
+    # Explicit session arguments are authoritative. If neither an integration
+    # record nor an explicit argument exists, use a picker instead of guessing.
+    for child_pid, depth in kids:
+        cwd = read_proc_cwd(child_pid)
+        if not cwd:
+            continue
+        argv = read_proc_argv(child_pid)
+        exe = Path(argv[0]).name if argv else ""
+        if argv_invokes_pi(argv):
+            env = read_proc_environ(child_pid)
+            command = pi_command_from_env(env)
+            pi_args = command_tail(argv, "pi")
+            if "--no-session" in pi_args:
+                return cwd, [command], {}
+            explicit_session = explicit_pi_session_from_argv(argv, cwd)
+            if explicit_session:
+                used_sessions.setdefault("pi", set()).add(explicit_session)
+                return cwd, [command, "--session", explicit_session], {
+                    "tool": "pi", "id": explicit_session, "path": explicit_session,
+                    "command": command, "match": "argv-session",
+                }
+            if argv_has_pi_continue(argv) or exe == "pi":
+                return cwd, [command, "--resume"], {
+                    "tool": "pi", "id": "picker", "command": command,
+                    "match": "picker-fallback",
+                }
+
+        if exe == "claude":
+            env = read_proc_environ(child_pid)
+            command = claude_command_from_env(env)
+            project_root = claude_project_root_from_env(env)
+            used_key = f"claude:{project_root}"
+            explicit_session = explicit_claude_session_from_argv(argv)
+            if explicit_session:
+                used_sessions.setdefault(used_key, set()).add(explicit_session)
+                return cwd, [command, "--resume", explicit_session], {
+                    "tool": "claude", "id": explicit_session, "command": command,
+                    "projectRoot": str(project_root), "match": "argv-session",
+                }
+            return cwd, [command, "--resume"], {
+                "tool": "claude", "id": "picker", "command": command,
+                "projectRoot": str(project_root), "match": "picker-fallback",
+            }
+
+        if exe == "codex":
+            env = read_proc_environ(child_pid)
+            command = codex_command_from_process(argv, env)
+            session_root = codex_session_root_from_env(env)
+            used_key = f"codex:{session_root}"
+            explicit_session = explicit_codex_session_from_argv(argv)
+            if explicit_session:
+                used_sessions.setdefault(used_key, set()).add(explicit_session)
+                session = explicit_session
+                match = "argv-session"
+            else:
+                session = codex_session_from_process_logs(child_pid, cwd, env)
+                match = "pid-log"
+            if session:
+                used_sessions.setdefault(used_key, set()).add(session)
+                return cwd, [command, "resume", session], {
+                    "tool": "codex", "id": session, "command": command,
+                    "sessionRoot": str(session_root), "match": match,
+                }
+            return cwd, [command, "resume"], {
+                "tool": "codex", "id": "picker", "command": command,
+                "sessionRoot": str(session_root), "match": "picker-fallback",
+            }
+
+        if exe == "opencode":
+            env = read_proc_environ(child_pid)
+            command = opencode_command_from_env(env)
+            db_path = opencode_db_from_env(env)
+            used_key = f"opencode:{db_path}"
+            explicit_session = explicit_opencode_session_from_argv(argv)
+            if explicit_session:
+                used_sessions.setdefault(used_key, set()).add(explicit_session)
+                session = explicit_session
+                match = "argv-session"
+            else:
+                session = ""
+                match = "plain-fallback"
+            if session:
+                # OpenCode's session store exposes stable ses_* IDs. Some
+                # versions accept --session; if a future/older wrapper rejects
+                # it, fall back to plain opencode in the saved directory.
+                quoted_command = shlex.quote(command)
+                cmd = f"{quoted_command} --session {shlex.quote(session)} || {quoted_command}"
+                return cwd, ["sh", "-lc", cmd], {
+                    "tool": "opencode", "id": session, "command": command,
+                    "database": str(db_path), "match": match,
+                }
+            return cwd, [command], {
+                "tool": "opencode", "id": "latest", "command": command,
+                "database": str(db_path),
+                "match": "plain-fallback",
+            }
+
+    # Otherwise preserve the user's wrapper command for known interactive Make
+    # targets. This keeps workflows like `make ssh` and remote `make pi N=docs`
+    # intact instead of trying to reverse-engineer their long child commands.
+    for child_pid, depth in kids:
+        cwd = read_proc_cwd(child_pid)
+        if not cwd:
+            continue
+        argv = read_proc_argv(child_pid)
+        make_argv = make_restore_argv(argv)
+        if make_argv:
+            return cwd, make_argv, {}
+
+    for child_pid, depth in kids:
+        cwd = read_proc_cwd(child_pid)
+        if not cwd:
+            continue
+        argv = read_proc_argv(child_pid)
+        exe = Path(argv[0]).name if argv else ""
+        cmd = " ".join(argv)
+
+        if exe in DIRECT_RESTORE_COMMANDS and argv:
+            direct_score = 900 - depth
+            if direct_score > best[0]:
+                restore_argv = safe_terminal_restore_argv(argv)
+                restore_session = {}
+                best = (direct_score, cwd)
+            continue
+
+        score = depth
+        if cwd != fallback:
+            score += 10
+        if cwd != home:
+            score += 10
+        if exe in {"nvim", "vim", "vi", "node", "python", "python3", "bash", "zsh", "fish"}:
+            score += 4
+        if " pi" in cmd:
+            score += 6
+        if score > best[0]:
+            best = (score, cwd)
+
+    return best[1], restore_argv, restore_session
+
+
+def raw_clients() -> list[dict]:
+    raw = subprocess.check_output(["hyprctl", "clients", "-j"], text=True)
+    return json.loads(raw)
+
+
+def raw_monitors() -> list[dict]:
+    try:
+        raw = subprocess.check_output(["hyprctl", "monitors", "-j"], text=True)
+        return json.loads(raw)
+    except Exception:
+        return []
+
+
+def monitor_name_by_id() -> dict[int, str]:
+    return {m.get("id"): m.get("name") for m in raw_monitors() if m.get("name") is not None}
+
+
+def collect_windows() -> list[dict]:
+    require("hyprctl")
+    clients = raw_clients()
+    windows = []
+    proc_children = child_map()
+    monitors = monitor_name_by_id()
+    used_sessions: dict[str, set[str]] = {}
+    browser_args_by_pid: dict[int, list[str]] = {}
+
+    for c in clients:
+        cls = c.get("class") or ""
+        if not cls or cls.lower() in EXCLUDED_CLASSES:
+            continue
+        pid = c.get("pid") or 0
+        cwd, cmdline, workdir, argv = proc_info(pid)
+        restore_argv: list[str] = []
+        restore_session: dict = {}
+        if cls.lower() in TERMINAL_CLASSES:
+            workdir, restore_argv, restore_session = terminal_child_state(pid, workdir, proc_children, used_sessions)
+        ws = c.get("workspace") or {}
+        grouped = c.get("grouped") or []
+        group_index = grouped.index(c.get("address")) if c.get("address") in grouped else 0
+        windows.append({
+            "address": c.get("address"),
+            "class": cls,
+            "initialClass": c.get("initialClass"),
+            "title": c.get("title") or "",
+            "initialTitle": c.get("initialTitle"),
+            "pid": pid,
+            "workspace": {"id": ws.get("id"), "name": ws.get("name")},
+            "monitor": c.get("monitor"),
+            "monitorName": monitors.get(c.get("monitor"), ""),
+            "grouped": grouped,
+            "groupIndex": group_index,
+            "groupSize": len(grouped),
+            "floating": c.get("floating"),
+            "fullscreen": c.get("fullscreen"),
+            "size": c.get("size"),
+            "at": c.get("at"),
+            "procCwd": cwd,
+            "procCmdline": cmdline,
+            "procArgv": argv,
+            "restoreWorkdir": workdir,
+            "restoreArgv": restore_argv,
+            "agentSession": restore_session,
+            "piSession": restore_session.get("path", "") if restore_session.get("tool") == "pi" else "",
+        })
+        if cls.lower() in BROWSER_CLASSES:
+            if pid not in browser_args_by_pid:
+                browser_args_by_pid[pid] = browser_profile_args_for_process(windows[-1], pid)
+            windows[-1]["browserProfileArgs"] = browser_args_by_pid[pid]
+
+    windows.sort(key=lambda w: (w.get("workspace", {}).get("id") or 0, w.get("class") or "", w.get("title") or ""))
+    return windows
+
+
+def clean_name(name: str) -> str:
+    cleaned = "".join(ch for ch in name.strip() if ch.isalnum() or ch in "._-")
+    if not cleaned:
+        print(f"Invalid session name: {name!r}", file=sys.stderr)
+        sys.exit(1)
+    return cleaned
+
+
+def session_path(name: str | None = None) -> Path:
+    if not name or name in {"default", "last"}:
+        return SESSION_FILE
+    if name in {"autosave", "latest-autosave", "latest"}:
+        return LATEST_AUTOSAVE
+    return PROFILE_DIR / f"{clean_name(name)}.json"
+
+
+def active_session_snapshot(windows: list[dict]) -> dict:
+    active = active_window()
+    address = active.get("address") or ""
+    matched = next((w for w in windows if w.get("address") == address), {})
+    workspace = active.get("workspace") or matched.get("workspace") or {}
+    grouped = active.get("grouped") or matched.get("grouped") or []
+    group_index = grouped.index(address) if address in grouped else matched.get("groupIndex", 0)
+    return {
+        "address": address,
+        "class": active.get("class") or matched.get("class") or "",
+        "title": active.get("title") or matched.get("title") or "",
+        "workspace": {"id": workspace.get("id"), "name": workspace.get("name")},
+        "monitor": active.get("monitor"),
+        "grouped": grouped,
+        "groupIndex": group_index,
+        "restoreKey": restore_key(matched) if matched else "",
+    }
+
+
+def human_path(path: Path | str) -> str:
+    text = str(path)
+    home = str(Path.home())
+    if text == home:
+        return "~"
+    if text.startswith(home + "/"):
+        return "~" + text[len(home):]
+    return text
+
+
+def plural(count: int, singular: str, plural_word: str | None = None) -> str:
+    word = singular if count == 1 else (plural_word or f"{singular}s")
+    return f"{count} {word}"
+
+
+def session_summary(windows: list[dict]) -> str:
+    workspaces = {workspace_spec(w) for w in windows if workspace_spec(w) != "0"}
+    grouped = {tuple(w.get("grouped") or []) for w in windows if len(w.get("grouped") or []) > 1}
+    terminal_resumes = sum(
+        1 for w in windows
+        if lc_class(w) in TERMINAL_CLASSES and (w.get("restoreArgv") or (w.get("agentSession") or {}).get("id"))
+    )
+    browser_profiles = {
+        (lc_class(w), browser_profile_identity(w))
+        for w in windows if browser_profile_identity(w)
+    }
+    parts = [plural(len(windows), "window")]
+    if workspaces:
+        parts.append(f"across {plural(len(workspaces), 'workspace')}")
+    if terminal_resumes:
+        parts.append(plural(terminal_resumes, "terminal resume"))
+    if browser_profiles:
+        parts.append(plural(len(browser_profiles), "browser profile"))
+    if grouped:
+        parts.append(plural(len(grouped), "group"))
+    return ", ".join(parts)
+
+
+def compact_session_summary(windows: list[dict]) -> str:
+    workspaces = {workspace_spec(w) for w in windows if workspace_spec(w) != "0"}
+    grouped = {tuple(w.get("grouped") or []) for w in windows if len(w.get("grouped") or []) > 1}
+    terminal_resumes = sum(
+        1 for w in windows
+        if lc_class(w) in TERMINAL_CLASSES and (w.get("restoreArgv") or (w.get("agentSession") or {}).get("id"))
+    )
+    browser_profiles = {
+        (lc_class(w), browser_profile_identity(w))
+        for w in windows if browser_profile_identity(w)
+    }
+    parts = [f"w{len(windows)}", f"ws{len(workspaces)}", f"g{len(grouped)}"]
+    if terminal_resumes:
+        parts.append(f"t{terminal_resumes}")
+    if browser_profiles:
+        parts.append(f"b{len(browser_profiles)}")
+    return " ".join(parts)
+
+
+def session_file_summary(path: Path) -> str:
+    if not path.exists() and not path.is_symlink():
+        return "missing"
+    try:
+        data = json.loads(path.read_text())
+        return f"{session_summary(data.get('windows', []))}, {file_age(path)}"
+    except Exception:
+        return "unreadable"
+
+
+def session_picker_summary(path: Path) -> str:
+    if not path.exists() and not path.is_symlink():
+        return "missing"
+    try:
+        data = json.loads(path.read_text())
+        return f"{compact_session_summary(data.get('windows', []))}, {file_age(path)}"
+    except Exception:
+        return "unreadable"
+
+
+def unknown_class_key(win: dict) -> str:
+    return lc_class(win) or "(empty)"
+
+
+def is_unknown_app_reason(reason: str) -> bool:
+    return reason.startswith("unknown app class:")
+
+
+def unknown_class_example(win: dict, source: Path | None = None) -> dict:
+    example = {
+        "seenAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "class": win.get("class") or "",
+        "title": win.get("title") or "",
+        "workspace": workspace_spec(win),
+        "monitorName": win.get("monitorName") or "",
+        "restoreKey": restore_key(win),
+    }
+    if win.get("restoreWorkdir"):
+        example["restoreWorkdir"] = win.get("restoreWorkdir")
+    if source:
+        example["source"] = str(source)
+    return example
+
+
+def read_unknown_classes_log() -> dict:
+    if not UNKNOWN_CLASSES_FILE.exists():
+        return {"classes": {}}
+    try:
+        data = json.loads(UNKNOWN_CLASSES_FILE.read_text())
+        if not isinstance(data, dict):
+            return {"classes": {}}
+        classes = data.get("classes")
+        if not isinstance(classes, dict):
+            data["classes"] = {}
+        return data
+    except Exception:
+        return {"classes": {}}
+
+
+def write_unknown_classes_log(data: dict) -> None:
+    UNKNOWN_CLASSES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = UNKNOWN_CLASSES_FILE.with_suffix(UNKNOWN_CLASSES_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(UNKNOWN_CLASSES_FILE)
+
+
+def log_unknown_app_class(win: dict, source: Path | None = None) -> None:
+    key = unknown_class_key(win)
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    data = read_unknown_classes_log()
+    data["updatedAt"] = now
+    classes = data.setdefault("classes", {})
+    group = classes.setdefault(key, {
+        "class": win.get("class") or "",
+        "count": 0,
+        "firstSeenAt": now,
+        "lastSeenAt": now,
+        "examples": [],
+    })
+    group["class"] = group.get("class") or win.get("class") or ""
+    group["count"] = int(group.get("count") or 0) + 1
+    group.setdefault("firstSeenAt", now)
+    group["lastSeenAt"] = now
+
+    examples = [item for item in (group.get("examples") or []) if isinstance(item, dict)]
+    example = unknown_class_example(win, source)
+    signature = (example.get("title"), example.get("workspace"), example.get("restoreWorkdir"))
+    examples = [
+        item for item in examples
+        if (item.get("title"), item.get("workspace"), item.get("restoreWorkdir")) != signature
+    ]
+    examples.insert(0, example)
+    group["examples"] = examples[:8]
+    write_unknown_classes_log(data)
+
+
+def unknown_classes_summary() -> str:
+    data = read_unknown_classes_log()
+    classes = data.get("classes") or {}
+    if not classes:
+        return "none"
+    total = sum(int(group.get("count") or 0) for group in classes.values() if isinstance(group, dict))
+    return f"{len(classes)} class(es), {total} occurrence(s), {file_age(UNKNOWN_CLASSES_FILE)}"
+
+
+def list_unknown_classes() -> None:
+    data = read_unknown_classes_log()
+    classes = data.get("classes") or {}
+    if not classes:
+        print(f"No unknown app classes logged at {human_path(UNKNOWN_CLASSES_FILE)}")
+        return
+    print(f"Unknown app classes: {unknown_classes_summary()}")
+    for key, group in sorted(classes.items(), key=lambda item: (-int((item[1] or {}).get("count") or 0), item[0])):
+        if not isinstance(group, dict):
+            continue
+        label = group.get("class") or key
+        print(f"{label}: {int(group.get('count') or 0)} occurrence(s), last seen {group.get('lastSeenAt') or 'unknown'}")
+        for example in group.get("examples") or []:
+            title = example.get("title") or "(untitled)"
+            workspace = example.get("workspace") or "?"
+            source = f" [{human_path(example.get('source'))}]" if VERBOSE and example.get("source") else ""
+            print(f"  workspace {workspace}: {title}{source}")
+
+
+def windows_for_workspace_save(windows: list[dict], workspaces: set[str]) -> list[dict]:
+    selected = [dict(win) for win in windows if workspace_spec(win) in workspaces]
+    selected_addresses = {win.get("address") or "" for win in selected}
+    for win in selected:
+        grouped = set(win.get("grouped") or [])
+        if grouped and not grouped.issubset(selected_addresses):
+            win["grouped"] = []
+            win["groupIndex"] = 0
+            win["groupSize"] = 0
+    return selected
+
+
+def write_session(path: Path, *, quiet: bool = False, workspaces: set[str] | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    windows = collect_windows()
+    if workspaces:
+        windows = windows_for_workspace_save(windows, {str(workspace) for workspace in workspaces})
+        if not windows:
+            raise ValueError(f"No windows found on workspace {', '.join(sorted(workspaces))}")
+    active = active_session_snapshot(windows)
+    if workspaces and (active.get("address") or "") not in {win.get("address") for win in windows}:
+        active = {}
+    data = {
+        "savedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "host": os.environ.get("HOSTNAME", ""),
+        "activeWindow": active,
+        "windows": windows,
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(path)
+    if not quiet:
+        target = f" ({human_path(path)})" if VERBOSE else ""
+        print(f"Saved {session_summary(data['windows'])}{target}")
+        notify("Omarchy session saved", f"{len(data['windows'])} windows saved")
+
+
+def cleanup_autosaves(keep: int = AUTOSAVE_KEEP) -> None:
+    if not AUTOSAVE_DIR.exists():
+        return
+    snapshots = sorted(p for p in AUTOSAVE_DIR.glob("*.json") if p.name != "latest.json")
+    for old in snapshots[:-keep]:
+        try:
+            old.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def autosave_once(*, quiet: bool = False) -> Path:
+    timestamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+    path = AUTOSAVE_DIR / f"{timestamp}.json"
+    write_session(path, quiet=quiet)
+    try:
+        tmp_latest = LATEST_AUTOSAVE.with_suffix(".tmp")
+        if tmp_latest.exists() or tmp_latest.is_symlink():
+            tmp_latest.unlink()
+        tmp_latest.symlink_to(path.name)
+        tmp_latest.replace(LATEST_AUTOSAVE)
+    except Exception:
+        # Fall back to a real file if symlinks/replace fail for any reason.
+        shutil.copy2(path, LATEST_AUTOSAVE)
+    cleanup_autosaves()
+    return path
+
+
+def autosave_loop() -> None:
+    lock = STATE_DIR / "autosave-loop.pid"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if lock.exists():
+        try:
+            old_pid = int(lock.read_text().strip())
+            os.kill(old_pid, 0)
+            if is_autosave_loop_pid(old_pid):
+                print(f"Autosave loop already running as PID {old_pid}")
+                return
+            print(f"Removing stale autosave pid file for PID {old_pid} (not autosave-loop)")
+            lock.unlink()
+        except Exception:
+            try:
+                lock.unlink()
+            except FileNotFoundError:
+                pass
+    lock.write_text(str(os.getpid()))
+    try:
+        while True:
+            path = autosave_once(quiet=True)
+            print(f"Autosaved session to {path}", flush=True)
+            time.sleep(3600)
+    finally:
+        try:
+            if lock.read_text().strip() == str(os.getpid()):
+                lock.unlink()
+        except Exception:
+            pass
+
+
+def list_autosaves() -> None:
+    if not AUTOSAVE_DIR.exists():
+        print(f"No autosaves found at {human_path(AUTOSAVE_DIR)}")
+        return
+    for path in sorted(AUTOSAVE_DIR.glob("*.json")):
+        marker = " -> latest" if path.resolve() == LATEST_AUTOSAVE.resolve() else ""
+        if path.name == "latest.json":
+            continue
+        label = human_path(path) if VERBOSE else path.stem
+        print(f"{label}: {session_file_summary(path)}{marker}")
+
+
+def load_session(path: Path) -> dict:
+    if not path.exists():
+        print(f"No saved session found at {path}", file=sys.stderr)
+        sys.exit(1)
+    return json.loads(path.read_text())
+
+
+def lc_class(win: dict) -> str:
+    return (win.get("class") or "").lower()
+
+
+def normalized_proc_argv(win: dict) -> list[str]:
+    argv = win.get("procArgv") or []
+    if isinstance(argv, str):
+        argv = [argv]
+    argv = [str(part) for part in argv]
+
+    # Some browser app windows expose their process cmdline as one space-joined
+    # string in /proc/<pid>/cmdline. Split that legacy/surprising shape back
+    # into arguments so --app/--user-data-dir can still be restored.
+    if len(argv) == 1 and " " in argv[0]:
+        try:
+            argv = shlex.split(argv[0])
+        except ValueError:
+            argv = []
+    if not argv and win.get("procCmdline"):
+        try:
+            argv = shlex.split(win.get("procCmdline") or "")
+            if len(argv) == 1 and " " in argv[0]:
+                argv = shlex.split(argv[0])
+        except ValueError:
+            argv = []
+
+    # Repair the common unquoted Chromium form "--profile-directory=Profile 3"
+    # after splitting a single space-joined command string.
+    repaired: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        profile_value = arg.split("=", 1)[1] if arg.startswith("--profile-directory=") else ""
+        if (
+            profile_value == "Profile"
+            and i + 1 < len(argv)
+            and argv[i + 1].isdigit()
+        ):
+            arg = f"{arg} {argv[i + 1]}"
+            i += 1
+        repaired.append(arg)
+        i += 1
+    return repaired
+
+
+def browser_profile_args(win: dict) -> list[str]:
+    """Return only browser profile/mode arguments that are safe to replay."""
+    if "browserProfileArgs" in win:
+        saved = win.get("browserProfileArgs") or []
+        return [str(arg) for arg in saved] if isinstance(saved, list) else []
+
+    cls = lc_class(win)
+    if cls not in BROWSER_CLASSES:
+        return []
+    argv = normalized_proc_argv(win)
+    kept: list[str] = []
+    if cls in CHROMIUM_BROWSER_CLASSES:
+        value_words = {"--profile-directory", "--user-data-dir"}
+        value_prefixes = ("--profile-directory=", "--user-data-dir=")
+        switches = {"--incognito", "--guest"}
+    else:
+        value_words = {"-P", "--profile", "-profile"}
+        value_prefixes = ("-P=", "--profile=", "-profile=")
+        switches = {"--no-remote", "--new-instance", "--private", "--private-window"}
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith(value_prefixes):
+            kept.append(arg)
+        elif arg in value_words and i + 1 < len(argv):
+            kept.extend([arg, argv[i + 1]])
+            i += 1
+        elif arg in switches:
+            kept.append(arg)
+        i += 1
+    return kept
+
+
+def browser_profile_selector_present(cls: str, args: list[str]) -> bool:
+    if cls in CHROMIUM_BROWSER_CLASSES:
+        return any(arg == "--profile-directory" or arg.startswith("--profile-directory=") for arg in args)
+    return any(
+        arg in {"-P", "--profile", "-profile"}
+        or arg.startswith(("-P=", "--profile=", "-profile="))
+        for arg in args
+    )
+
+
+def inferred_browser_profile_args(win: dict, fd_targets: list[str]) -> list[str]:
+    cls = lc_class(win)
+    if cls in FIREFOX_BROWSER_CLASSES:
+        profiles = {
+            str(Path(target).parent)
+            for target in fd_targets
+            if Path(target).name == ".parentlock"
+        }
+        if len(profiles) == 1:
+            return ["--profile", profiles.pop()]
+        return []
+
+    if cls not in CHROMIUM_BROWSER_CLASSES:
+        return []
+    args = browser_profile_args(win)
+    user_data = ""
+    for index, arg in enumerate(args):
+        if arg.startswith("--user-data-dir="):
+            user_data = arg.split("=", 1)[1]
+        elif arg == "--user-data-dir" and index + 1 < len(args):
+            user_data = args[index + 1]
+    if user_data:
+        root = Path(user_data).expanduser()
+    elif cls in {"brave", "brave-browser"}:
+        root = Path.home() / ".config/BraveSoftware/Brave-Browser"
+    elif cls in {"google-chrome", "google-chrome-stable"}:
+        root = Path.home() / ".config/google-chrome"
+    else:
+        root = Path.home() / ".config/chromium"
+
+    profiles: set[str] = set()
+    for target in fd_targets:
+        try:
+            relative = Path(target).relative_to(root)
+        except ValueError:
+            continue
+        if not relative.parts:
+            continue
+        candidate = relative.parts[0]
+        if candidate in {"Default", "Profile", "Guest Profile"} or candidate.startswith("Profile "):
+            profiles.add(candidate)
+    if len(profiles) == 1:
+        return [f"--profile-directory={profiles.pop()}"]
+    return []
+
+
+def firefox_profile_name(cls: str, profile_path: str) -> str:
+    zen_classes = {"zen", "zen-browser", "zen-twilight", "app.zen_browser.zen"}
+    profiles_ini = Path.home() / (
+        ".zen/profiles.ini" if cls in zen_classes else ".mozilla/firefox/profiles.ini"
+    )
+    if not profiles_ini.is_file():
+        return ""
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(profiles_ini)
+        wanted = Path(profile_path).resolve()
+        for section in parser.sections():
+            if not section.startswith("Profile"):
+                continue
+            configured = parser.get(section, "Path", fallback="")
+            if not configured:
+                continue
+            candidate = Path(configured)
+            if parser.getboolean(section, "IsRelative", fallback=True):
+                candidate = profiles_ini.parent / candidate
+            if candidate.expanduser().resolve() == wanted:
+                return parser.get(section, "Name", fallback="")
+    except Exception:
+        return ""
+    return ""
+
+
+def browser_profile_args_for_process(win: dict, pid: int) -> list[str]:
+    args = browser_profile_args(win)
+    cls = lc_class(win)
+    if browser_profile_selector_present(cls, args) or pid <= 0:
+        return args
+    targets: list[str] = []
+    try:
+        for fd in Path(f"/proc/{pid}/fd").iterdir():
+            try:
+                targets.append(str(fd.resolve()))
+            except Exception:
+                continue
+    except Exception:
+        return args
+    inferred = inferred_browser_profile_args(win, targets)
+    if cls in FIREFOX_BROWSER_CLASSES and len(inferred) == 2 and inferred[0] == "--profile":
+        profile_name = firefox_profile_name(cls, inferred[1])
+        if profile_name:
+            inferred = ["-P", profile_name]
+    return [*inferred, *args]
+
+
+def browser_profile_identity(win: dict) -> str:
+    args = browser_profile_args(win)
+    return shlex.join(args) if args else ""
+
+
+def browser_profile_summary(win: dict) -> str:
+    args = browser_profile_args(win)
+    if not args:
+        return ""
+    for index, arg in enumerate(args):
+        if arg.startswith("--profile-directory="):
+            return arg.split("=", 1)[1]
+        if arg in {"--profile-directory", "-P"} and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith(("--profile=", "-profile=", "-P=")):
+            return human_path(arg.split("=", 1)[1])
+        if arg in {"--profile", "-profile", "--user-data-dir"} and index + 1 < len(args):
+            return human_path(args[index + 1])
+        if arg.startswith("--user-data-dir="):
+            return human_path(arg.split("=", 1)[1])
+    modes = [arg.removeprefix("--") for arg in args if arg.startswith("--")]
+    return ", ".join(modes)
+
+
+def chrome_app_url_from_class(cls: str) -> str:
+    match = re.match(r"^chrome-([^_]+)__-", cls.lower())
+    if not match:
+        return ""
+    host = match.group(1).strip("-.")
+    if "." not in host:
+        return ""
+    return f"https://{host}/"
+
+
+def url_host(url: str) -> str:
+    try:
+        return (urlparse(url).netloc or "").lower().removeprefix("www.")
+    except Exception:
+        return ""
+
+
+def chrome_app_flags_from_class(cls: str) -> list[str]:
+    match = re.match(r"^chrome-[^_]+__-(.+)$", cls)
+    if not match:
+        return []
+    profile = match.group(1).strip()
+    if not profile:
+        return []
+    return [f"--profile-directory={profile}"]
+
+
+def browser_app_args(win: dict) -> tuple[str, list[str]]:
+    argv = normalized_proc_argv(win)
+    raw_class = win.get("class") or ""
+    cls = raw_class.lower()
+    class_url = chrome_app_url_from_class(cls)
+
+    url = ""
+    flags: list[str] = []
+    keep_prefixes = ("--profile-directory=", "--user-data-dir=", "--class=", "--name=")
+    keep_words = {"--profile-directory", "--user-data-dir", "--class", "--name"}
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg.startswith("--app="):
+            url = arg.split("=", 1)[1]
+        elif arg == "--app" and i + 1 < len(argv):
+            url = argv[i + 1]
+            i += 1
+        elif arg.startswith(keep_prefixes):
+            flags.append(arg)
+        elif arg in keep_words and i + 1 < len(argv):
+            flags.extend([arg, argv[i + 1]])
+            i += 1
+        i += 1
+
+    # A plain browser class (e.g. "chromium") is a regular browser window, not
+    # a web app. Its procCmdline can still contain --app=... when it was spawned
+    # by a Chromium master process that was originally launched as a web app;
+    # ignore that inherited flag so we relaunch a regular browser window.
+    if not class_url and cls in SINGLETON_CLASSES:
+        return "", []
+
+    # Chromium web-app windows can all point at the browser's primary process,
+    # so proc argv may describe a different web app. Prefer the Hyprland class
+    # when the host disagrees; it is generated from the actual app window.
+    if class_url and (not url or url_host(url) != url_host(class_url)):
+        url = class_url
+        if not any(flag.startswith("--user-data-dir") for flag in flags):
+            flags = chrome_app_flags_from_class(raw_class)
+    return url, flags
+
+
+def is_webapp(win: dict) -> bool:
+    return bool(browser_app_args(win)[0])
+
+
+def is_singleton(win: dict) -> bool:
+    return lc_class(win) in SINGLETON_CLASSES and not is_webapp(win)
+
+
+def duplicate_singleton_addresses(targets: list[dict]) -> set[str]:
+    """Saved singleton app windows after the first cannot be restored reliably.
+
+    Plain browser/app classes like firefox/chromium intentionally use one stable
+    restore key because launches often reuse an existing app process/window. If a
+    saved session contains multiple targets with the same singleton key, only the
+    first can be matched honestly; later targets are recorded as restore
+    limitations instead of pretending they were independently restored.
+    """
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for win in targets:
+        if not is_singleton(win):
+            continue
+        key = restore_key(win)
+        address = win.get("address") or ""
+        if key in seen and address:
+            duplicates.add(address)
+        seen.add(key)
+    return duplicates
+
+
+def workspace_spec(win: dict) -> str:
+    ws = win.get("workspace") or {}
+    name = ws.get("name") or ""
+    wid = ws.get("id")
+    if name.startswith("special:"):
+        return name
+    if isinstance(wid, int) and wid < 0:
+        return name or "special:scratchpad"
+    return str(wid or 1)
+
+
+def is_special_workspace(win: dict) -> bool:
+    return workspace_spec(win).startswith("special:")
+
+
+def restore_key(win: dict) -> str:
+    cls = lc_class(win)
+    webapp_url, webapp_flags = browser_app_args(win)
+    ws = workspace_spec(win)
+    if webapp_url:
+        return f"ws:{ws}|webapp:{webapp_url}|flags:{' '.join(webapp_flags)}"
+    if cls in SINGLETON_CLASSES:
+        profile = browser_profile_identity(win) if cls in BROWSER_CLASSES else ""
+        return f"app:{cls}|browser:{profile}" if profile else f"app:{cls}"
+    workdir = win.get("restoreWorkdir") or ""
+    if cls in TERMINAL_CLASSES:
+        agent = win.get("agentSession") or {}
+        if agent.get("tool") and agent.get("id") and agent.get("id") not in {"latest", "picker"}:
+            return f"ws:{ws}|class:{cls}|agent:{agent.get('tool')}:{agent.get('id')}"
+        return f"ws:{ws}|class:{cls}|dir:{workdir}"
+    return f"ws:{ws}|class:{cls}"
+
+
+def uwsm_cmd(cmd: list[str]) -> list[str]:
+    if shutil.which("uwsm"):
+        return ["uwsm", "app", "--", *cmd]
+    return cmd
+
+
+def first_available_command(commands: list[str]) -> str:
+    for command in commands:
+        if shutil.which(command):
+            return command
+    return commands[0] if commands else ""
+
+
+def lua_quote(value: object) -> str:
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def dispatch_lua(dispatcher: str, argument: str = "") -> str | None:
+    """Translate pre-0.55 dispatcher calls to Hyprland's Lua API."""
+    if dispatcher == "exec":
+        match = re.match(r"^\[workspace (.+?) silent\] (.+)$", argument, re.DOTALL)
+        if match:
+            workspace, command = match.groups()
+            return (
+                f"hl.dispatch(hl.dsp.exec_cmd({lua_quote(command)}, "
+                f"{{ workspace = {lua_quote(workspace + ' silent')} }}))"
+            )
+        return f"hl.dispatch(hl.dsp.exec_cmd({lua_quote(argument)}))"
+
+    if dispatcher == "moveworkspacetomonitor":
+        workspace, separator, monitor = argument.partition(" ")
+        if separator:
+            return (
+                "hl.dispatch(hl.dsp.workspace.move({ "
+                f"workspace = {lua_quote(workspace)}, monitor = {lua_quote(monitor)} }}))"
+            )
+
+    if dispatcher == "movetoworkspacesilent":
+        workspace, separator, window = argument.partition(",")
+        if separator:
+            return (
+                "hl.dispatch(hl.dsp.window.move({ "
+                f"workspace = {lua_quote(workspace)}, window = {lua_quote(window)}, follow = false }}))"
+            )
+
+    if dispatcher == "setfloating":
+        return (
+            "hl.dispatch(hl.dsp.window.float({ "
+            f"action = \"enable\", window = {lua_quote(argument)} }}))"
+        )
+
+    if dispatcher in {"resizewindowpixel", "movewindowpixel"}:
+        match = re.match(r"^exact (-?\d+) (-?\d+),(.+)$", argument)
+        if match:
+            x, y, window = match.groups()
+            method = "resize" if dispatcher == "resizewindowpixel" else "move"
+            return (
+                f"hl.dispatch(hl.dsp.window.{method}({{ x = {int(x)}, y = {int(y)}, "
+                f"relative = false, window = {lua_quote(window)} }}))"
+            )
+
+    if dispatcher == "focuswindow":
+        return f"hl.dispatch(hl.dsp.focus({{ window = {lua_quote(argument)} }}))"
+
+    if dispatcher == "workspace":
+        return f"hl.dispatch(hl.dsp.focus({{ workspace = {lua_quote(argument)} }}))"
+
+    if dispatcher == "togglegroup":
+        return "hl.dispatch(hl.dsp.group.toggle())"
+
+    if dispatcher == "moveintogroup":
+        return (
+            "hl.dispatch(hl.dsp.window.move({ "
+            f"into_group = {lua_quote(argument)} }}))"
+        )
+
+    if dispatcher == "closewindow":
+        return f"hl.dispatch(hl.dsp.window.close({{ window = {lua_quote(argument)} }}))"
+
+    return None
+
+
+def hypr(*args: str, retries: int = 1, delay: float = 0.08) -> bool:
+    command = ["hyprctl", *args]
+    if len(args) >= 2 and args[0] == "dispatch":
+        code = dispatch_lua(args[1], args[2] if len(args) >= 3 else "")
+        if code:
+            command = ["hyprctl", "eval", code]
+
+    for attempt in range(retries + 1):
+        try:
+            result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if result.returncode == 0:
+                return True
+        except Exception:
+            pass
+        if attempt < retries:
+            time.sleep(delay)
+    return False
+
+
+def hypr_exec_on_workspace(cmd: list[str], ws: str) -> bool:
+    # Hyprland exec rules launch on the target workspace without switching your
+    # current focus there. This avoids restore yanking you around.
+    rule = f"[workspace {ws} silent] " if ws else ""
+    return hypr("dispatch", "exec", rule + shlex.join(uwsm_cmd(cmd)), retries=2)
+
+
+def monitor_target(win: dict) -> str:
+    name = win.get("monitorName") or ""
+    if name:
+        return str(name)
+    monitor = win.get("monitor")
+    if isinstance(monitor, int):
+        return str(monitor)
+    return ""
+
+
+def workspace_monitor_moves(
+    targets: list[dict], current_windows: list[dict] | None = None
+) -> list[tuple[str, str]]:
+    available_names = {m.get("name") for m in raw_monitors() if m.get("name")}
+    current_monitors: dict[str, set[str]] = {}
+    for current in current_windows or []:
+        current_monitors.setdefault(workspace_spec(current), set()).add(monitor_target(current))
+    moves: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for win in targets:
+        ws = workspace_spec(win)
+        if not ws or ws.startswith("special:"):
+            continue
+        monitor = monitor_target(win)
+        if not monitor:
+            continue
+        if available_names and not monitor.isdigit() and monitor not in available_names:
+            continue
+        key = (ws, monitor)
+        if key in seen or monitor in current_monitors.get(ws, set()):
+            continue
+        seen.add(key)
+        moves.append(key)
+    return moves
+
+
+def restore_workspace_monitors(targets: list[dict]) -> tuple[int, int]:
+    moved = 0
+    failed = 0
+    for ws, monitor in workspace_monitor_moves(targets):
+        if hypr("dispatch", "moveworkspacetomonitor", f"{ws} {monitor}", retries=2):
+            moved += 1
+        else:
+            failed += 1
+    return moved, failed
+
+
+def compatible_current_window(target: dict, candidate: dict) -> bool:
+    if restore_key(candidate) == restore_key(target):
+        return True
+    if lc_class(candidate) != lc_class(target):
+        return False
+    if lc_class(target) in BROWSER_CLASSES:
+        target_profile = browser_profile_identity(target)
+        candidate_profile = browser_profile_identity(candidate)
+        if "browserProfileArgs" in target and (target_profile or candidate_profile) and target_profile != candidate_profile:
+            return False
+
+    target_title = target.get("title") or ""
+    candidate_title = candidate.get("title") or ""
+    if target_title and candidate_title and target_title == candidate_title:
+        return True
+
+    target_url, target_flags = browser_app_args(target)
+    candidate_url, candidate_flags = browser_app_args(candidate)
+    if target_url and candidate_url and target_url == candidate_url and target_flags == candidate_flags:
+        return True
+
+    target_workdir = target.get("restoreWorkdir") or ""
+    candidate_workdir = candidate.get("restoreWorkdir") or ""
+    if lc_class(target) in TERMINAL_CLASSES and target_workdir and target_workdir == candidate_workdir:
+        return True
+
+    return is_singleton(target)
+
+
+def normalized_window_title(win: dict) -> str:
+    title = (win.get("title") or "").strip()
+    return re.sub(r"^[\u2800-\u28ff✳*•·]+\s*", "", title)
+
+
+def candidate_match_score(target: dict, candidate: dict) -> int:
+    if lc_class(candidate) != lc_class(target):
+        return 0
+    if lc_class(target) in BROWSER_CLASSES:
+        target_profile = browser_profile_identity(target)
+        candidate_profile = browser_profile_identity(candidate)
+        if "browserProfileArgs" in target and (target_profile or candidate_profile) and target_profile != candidate_profile:
+            return 0
+
+    score = 100 if restore_key(candidate) == restore_key(target) else 0
+    target_title = target.get("title") or ""
+    candidate_title = candidate.get("title") or ""
+    if target_title and candidate_title and target_title == candidate_title:
+        score = max(score, 90) + 20
+    elif normalized_window_title(target) and normalized_window_title(target) == normalized_window_title(candidate):
+        score = max(score, 88) + 20
+
+    target_url, target_flags = browser_app_args(target)
+    candidate_url, candidate_flags = browser_app_args(candidate)
+    if target_url and candidate_url and target_url == candidate_url and target_flags == candidate_flags:
+        score = max(score, 85)
+
+    target_workdir = target.get("restoreWorkdir") or ""
+    candidate_workdir = candidate.get("restoreWorkdir") or ""
+    if lc_class(target) in TERMINAL_CLASSES and target_workdir and target_workdir == candidate_workdir:
+        score = max(score, 75)
+
+    if is_singleton(target):
+        score = max(score, 60)
+    return score
+
+
+def match_existing_windows(targets: list[dict], current_windows: list[dict]) -> dict[str, dict]:
+    """Greedily match saved targets to live windows using restore compatibility.
+
+    A plan must use the same best-effort identity signals as post-restore
+    verification, not only exact restore-key counts. Session IDs can legitimately
+    become temporarily unavailable while titles/workdirs still identify the same
+    live terminal.
+    """
+    remaining_targets = [target for target in targets if target.get("address")]
+    remaining_current = [candidate for candidate in current_windows if candidate.get("address")]
+    matches: dict[str, dict] = {}
+    while remaining_targets and remaining_current:
+        best: tuple[int, int, int] | None = None
+        for target_index, target in enumerate(remaining_targets):
+            for current_index, candidate in enumerate(remaining_current):
+                score = candidate_match_score(target, candidate)
+                if score <= 0:
+                    continue
+                if workspace_spec(target) == workspace_spec(candidate):
+                    score += 10
+                if target.get("address") == candidate.get("address"):
+                    score += 5
+                if best is None or score > best[0]:
+                    best = (score, target_index, current_index)
+        if best is None:
+            break
+        _, target_index, current_index = best
+        target = remaining_targets.pop(target_index)
+        matched = remaining_current.pop(current_index)
+        matches[target.get("address") or ""] = matched
+    return matches
+
+
+def find_new_window(target: dict, before_addresses: set[str], timeout: float = 6.0) -> dict | None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            candidates = [
+                win for win in collect_windows()
+                if (win.get("address") or "") not in before_addresses
+            ]
+            scored = [
+                (candidate_match_score(target, win), win)
+                for win in candidates
+            ]
+            scored = [(score, win) for score, win in scored if score > 0]
+            if scored:
+                scored.sort(key=lambda item: item[0], reverse=True)
+                return scored[0][1]
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return None
+
+
+def apply_saved_state(target: dict, before_addresses: set[str]) -> tuple[str, int]:
+    win = find_new_window(target, before_addresses)
+    if not win:
+        return "", 0
+    address = win.get("address") or ""
+    if not address:
+        return "", 0
+    before_addresses.add(address)
+    failed_dispatches = 0
+
+    ws = workspace_spec(target)
+    if ws.startswith("special:"):
+        if not hypr("dispatch", "movetoworkspacesilent", f"{ws},address:{address}", retries=2):
+            failed_dispatches += 1
+        return address, failed_dispatches
+
+    if not hypr("dispatch", "movetoworkspacesilent", f"{ws},address:{address}", retries=2):
+        failed_dispatches += 1
+
+    # Best-effort: geometry restore is useful mostly for floating windows. Tiled
+    # windows are intentionally left to Hyprland's layout. Avoid focuswindow here
+    # so restore does not steal focus.
+    if target.get("floating"):
+        if not hypr("dispatch", "setfloating", f"address:{address}", retries=2):
+            failed_dispatches += 1
+        size = target.get("size") or []
+        at = target.get("at") or []
+        if len(size) == 2 and not hypr("dispatch", "resizewindowpixel", f"exact {size[0]} {size[1]},address:{address}", retries=2):
+            failed_dispatches += 1
+        if len(at) == 2 and not hypr("dispatch", "movewindowpixel", f"exact {at[0]} {at[1]},address:{address}", retries=2):
+            failed_dispatches += 1
+    return address, failed_dispatches
+
+
+def active_window() -> dict:
+    try:
+        raw = subprocess.check_output(["hyprctl", "activewindow", "-j"], text=True)
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def window_group(address: str) -> list[str]:
+    try:
+        for win in raw_clients():
+            if win.get("address") == address:
+                return win.get("grouped") or []
+    except Exception:
+        pass
+    return []
+
+
+def addresses_same_group(addresses: list[str]) -> bool:
+    wanted = set(addresses)
+    if len(wanted) < 2:
+        return True
+    for address in wanted:
+        grouped = set(window_group(address))
+        if wanted.issubset(grouped):
+            return True
+    return False
+
+
+def current_addresses_from_outcomes(target_outcomes: list[dict] | None) -> dict[str, str]:
+    addresses: dict[str, str] = {}
+    for outcome in target_outcomes or []:
+        saved_address = outcome.get("savedAddress") or ""
+        current_address = outcome.get("currentAddress") or ""
+        if saved_address and current_address:
+            addresses[saved_address] = current_address
+    return addresses
+
+
+def assign_current_addresses(
+    targets: list[dict],
+    current: list[dict] | None = None,
+    preferred: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Map saved Hyprland addresses to current ones after restore.
+
+    Addresses change after reboot, so this uses stable restore keys and then
+    falls back to workspace/class/title matching. It is only used for best-effort
+    Hyprland group/tab restoration.
+    """
+    if current is None:
+        current = collect_windows()
+    used: set[str] = set()
+    assigned: dict[str, str] = {}
+
+    current_by_address = {w.get("address"): w for w in current if w.get("address")}
+    targets_by_saved_address = saved_window_by_address(targets)
+
+    for saved_address, current_address in (preferred or {}).items():
+        target = targets_by_saved_address.get(saved_address)
+        candidate = current_by_address.get(current_address)
+        if (
+            target
+            and candidate
+            and current_address not in used
+            and compatible_current_window(target, candidate)
+        ):
+            assigned[saved_address] = current_address
+            used.add(current_address)
+
+    for target in targets:
+        saved_address = target.get("address") or ""
+        candidate = current_by_address.get(saved_address)
+        if (
+            saved_address
+            and saved_address not in assigned
+            and candidate
+            and saved_address not in used
+            and compatible_current_window(target, candidate)
+        ):
+            assigned[saved_address] = saved_address
+            used.add(saved_address)
+
+    def pick(target: dict, candidates: list[dict]) -> str:
+        title = target.get("title") or ""
+        for candidate in candidates:
+            addr = candidate.get("address") or ""
+            if addr not in used and (candidate.get("title") or "") == title:
+                return addr
+        for candidate in candidates:
+            addr = candidate.get("address") or ""
+            if addr not in used:
+                return addr
+        return ""
+
+    for target in targets:
+        saved_address = target.get("address") or ""
+        if not saved_address or saved_address in assigned:
+            continue
+        key = restore_key(target)
+        addr = pick(target, [w for w in current if restore_key(w) == key])
+        if not addr:
+            ws = workspace_spec(target)
+            cls = lc_class(target)
+            addr = pick(target, [w for w in current if workspace_spec(w) == ws and lc_class(w) == cls])
+        if addr:
+            assigned[saved_address] = addr
+            used.add(addr)
+
+    return assigned
+
+
+# Grouping windows back into Hyprland tab groups is inherently racy: each
+# dispatch is asynchronous and `moveintogroup` only works toward a window that is
+# spatially adjacent *right now*. These knobs trade a little restore latency for
+# reliability — they are deliberately generous because a missed group is far more
+# annoying than a few hundred milliseconds.
+GROUP_SETTLE = 0.12          # let one dispatch take effect before re-reading state
+GROUP_HEAD_TIMEOUT = 0.40    # max wait for a lone window to become a group head
+GROUP_JOIN_TIMEOUT = 0.30    # max wait for one window to join the head's group
+GROUP_PASSES = 4             # full sweeps over still-ungrouped members
+
+
+def wait_until(predicate, timeout: float, interval: float = 0.05) -> bool:
+    deadline = time.time() + timeout
+    while True:
+        if predicate():
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+def wait_for_same_group(addresses: list[str], timeout: float = 0.45, interval: float = 0.05) -> bool:
+    return wait_until(lambda: addresses_same_group(addresses), timeout, interval)
+
+
+def window_in_group(address: str) -> bool:
+    """True when Hyprland reports the window as part of any group.
+
+    A lone window toggled into a group still lists itself in `grouped`, so a
+    non-empty list reliably means "this window can accept moveintogroup".
+    """
+    return bool(window_group(address))
+
+
+def ensure_group_head(address: str) -> bool:
+    """Toggle a lone window into a group so others can be moved into it.
+
+    Retries the toggle: a single `togglegroup` dispatch can be dropped while the
+    window is still settling, and the old code never confirmed it took effect
+    (its wait used a single address, which is trivially "already grouped").
+    """
+    if window_in_group(address):
+        return True
+    for _ in range(3):
+        if not hypr("dispatch", "focuswindow", f"address:{address}", retries=2):
+            return window_in_group(address)
+        hypr("dispatch", "togglegroup", retries=2)
+        if wait_until(lambda: window_in_group(address), GROUP_HEAD_TIMEOUT):
+            return True
+    return window_in_group(address)
+
+
+def move_into_group(head: str, address: str) -> bool:
+    """Best-effort: focus `address` and slide it into `head`'s group from any side.
+
+    `moveintogroup` is directional and relative to the focused window, so we
+    sweep all four directions and confirm membership after each. Focus is given a
+    moment to settle first, otherwise the directional move reads stale adjacency.
+    """
+    if addresses_same_group([head, address]):
+        return True
+    if not hypr("dispatch", "focuswindow", f"address:{address}", retries=2):
+        return False
+    time.sleep(GROUP_SETTLE)
+    for direction in ("l", "r", "u", "d"):
+        if not hypr("dispatch", "moveintogroup", direction, retries=1):
+            continue
+        if wait_until(lambda: addresses_same_group([head, address]), GROUP_JOIN_TIMEOUT):
+            return True
+    return addresses_same_group([head, address])
+
+
+def group_addresses(addresses: list[str]) -> bool:
+    addresses = list(dict.fromkeys(a for a in addresses if a))
+    if len(addresses) < 2 or addresses_same_group(addresses):
+        return True
+
+    head, members = addresses[0], addresses[1:]
+    if not ensure_group_head(head):
+        return addresses_same_group(addresses)
+
+    # Repeated passes over only the windows that have not joined yet. A transient
+    # focus/dispatch failure on one member no longer aborts the whole group; it is
+    # simply retried on the next pass, and the layout may have shifted enough by
+    # then for a previously non-adjacent window to slide in.
+    pending = list(members)
+    for _ in range(GROUP_PASSES):
+        pending = [a for a in pending if not move_into_group(head, a)]
+        if not pending:
+            return True
+        time.sleep(GROUP_SETTLE)
+    return addresses_same_group(addresses)
+
+
+def saved_group_addresses(targets: list[dict]) -> list[tuple[str, ...]]:
+    groups: list[tuple[str, ...]] = []
+    seen: set[tuple[str, ...]] = set()
+    for win in targets:
+        grouped = tuple(a for a in (win.get("grouped") or []) if a)
+        if len(grouped) > 1 and grouped not in seen:
+            seen.add(grouped)
+            groups.append(grouped)
+    return groups
+
+
+def saved_window_by_address(targets: list[dict]) -> dict[str, dict]:
+    return {w.get("address") or "": w for w in targets if w.get("address")}
+
+
+def group_member_summaries(group: tuple[str, ...], by_address: dict[str, dict]) -> list[str]:
+    summaries = []
+    for address in group:
+        win = by_address.get(address)
+        summaries.append(window_summary(win) if win else f"saved address {address} (not in saved windows)")
+    return summaries
+
+
+def group_status_counts(assessments: list[dict], statuses: list[str]) -> Counter:
+    counts = Counter(a.get("status", "") for a in assessments)
+    for status in statuses:
+        counts.setdefault(status, 0)
+    return counts
+
+
+def assess_dry_run_groups(
+    targets: list[dict], current_windows: list[dict], planned_actions: dict[str, str]
+) -> list[dict]:
+    assigned = assign_current_addresses(targets, current_windows)
+    by_address = saved_window_by_address(targets)
+    assessments: list[dict] = []
+
+    for group in saved_group_addresses(targets):
+        missing_metadata = [a for a in group if a not in by_address]
+        actions = {a: planned_actions.get(a, "") for a in group if a in by_address}
+        missing_actions = [a for a in group if a in by_address and not actions.get(a)]
+        assigned_missing = [a for a in group if actions.get(a) == "already_open" and not assigned.get(a)]
+
+        if missing_metadata or missing_actions or assigned_missing:
+            status = "cannot_assess"
+        elif any(action in {"skipped", "duplicate_singleton_unsupported"} for action in actions.values()):
+            status = "partial_missing"
+        elif all(action == "already_open" for action in actions.values()):
+            current_addresses = list(dict.fromkeys(assigned[a] for a in group if assigned.get(a)))
+            if len(current_addresses) == len(group) and addresses_same_group(current_addresses):
+                status = "already_correct"
+            else:
+                status = "would_regroup"
+        else:
+            status = "would_regroup"
+
+        assessments.append({
+            "group": group,
+            "status": status,
+            "members": group_member_summaries(group, by_address),
+            "missingMetadata": missing_metadata,
+            "missingActions": missing_actions,
+            "assignedMissing": assigned_missing,
+            "actions": actions,
+        })
+
+    return assessments
+
+
+def verify_saved_groups(targets: list[dict], assigned: dict[str, str]) -> list[dict]:
+    by_address = saved_window_by_address(targets)
+    assessments: list[dict] = []
+
+    for group in saved_group_addresses(targets):
+        missing_metadata = [a for a in group if a not in by_address]
+        current_by_saved = {a: assigned[a] for a in group if assigned.get(a)}
+        current_addresses = list(dict.fromkeys(current_by_saved.values()))
+        missing_saved = [a for a in group if a in by_address and not assigned.get(a)]
+
+        if missing_metadata:
+            status = "cannot_assess"
+        elif missing_saved or len(current_addresses) < len(group):
+            status = "partial_missing"
+        elif addresses_same_group(current_addresses):
+            status = "correct"
+        else:
+            status = "failed"
+
+        assessments.append({
+            "group": group,
+            "status": status,
+            "members": group_member_summaries(group, by_address),
+            "missingMetadata": missing_metadata,
+            "missingSavedAddresses": missing_saved,
+            "currentBySavedAddress": current_by_saved,
+            "currentAddresses": current_addresses,
+            "presentButNotGrouped": current_addresses if status == "failed" else [],
+        })
+
+    return assessments
+
+
+def group_status_label(status: str) -> str:
+    return {
+        "already_correct": "already correct",
+        "would_regroup": "would regroup",
+        "partial_missing": "partial/missing",
+        "cannot_assess": "cannot assess",
+    }.get(status, status.replace("_", " "))
+
+
+def print_verbose_group_details(assessments: list[dict]) -> None:
+    if not VERBOSE or not assessments:
+        return
+    for index, assessment in enumerate(assessments, start=1):
+        print(
+            f"  group {index}: {group_status_label(assessment['status'])} "
+            f"({len(assessment['group'])} saved members)"
+        )
+        actions = assessment.get("actions") or {}
+        if actions:
+            action_counts = Counter(actions.values())
+            print(
+                f"    actions: already open {action_counts.get('already_open', 0)}, "
+                f"would launch {action_counts.get('would_launch', 0)}, "
+                f"skipped {action_counts.get('skipped', 0)}"
+            )
+        current_addresses = assessment.get("currentAddresses") or []
+        if current_addresses:
+            print(f"    current addresses: {', '.join(current_addresses)}")
+        missing = (
+            (assessment.get("missingMetadata") or [])
+            + (assessment.get("missingActions") or [])
+            + (assessment.get("assignedMissing") or [])
+            + (assessment.get("missingSavedAddresses") or [])
+        )
+        if missing:
+            print(f"    unresolved saved addresses: {', '.join(dict.fromkeys(missing))}")
+        present_not_grouped = assessment.get("presentButNotGrouped") or []
+        if present_not_grouped:
+            print(f"    present but not grouped: {', '.join(present_not_grouped)}")
+        for member in assessment.get("members", []):
+            print(f"    - {member}")
+
+
+def restore_groups(targets: list[dict], target_outcomes: list[dict] | None = None) -> tuple[int, dict[str, str]]:
+    assigned = assign_current_addresses(targets, preferred=current_addresses_from_outcomes(target_outcomes))
+    groups = saved_group_addresses(targets)
+    if not groups:
+        return 0, assigned
+
+    restored = 0
+    for saved_addresses in groups:
+        current_addresses = [assigned[a] for a in saved_addresses if a in assigned]
+        # Deduplicate while preserving saved group/tab order.
+        current_addresses = list(dict.fromkeys(current_addresses))
+        if len(current_addresses) < 2 or addresses_same_group(current_addresses):
+            continue
+        if group_addresses(current_addresses):
+            restored += 1
+
+    return restored, assigned
+
+
+def workspace_from_snapshot(snapshot: dict) -> str:
+    ws = snapshot.get("workspace") or {}
+    name = ws.get("name") or ""
+    wid = ws.get("id")
+    if name.startswith("special:"):
+        return name
+    if isinstance(wid, int) and wid < 0:
+        return name or "special:scratchpad"
+    return str(wid or "")
+
+
+def restore_saved_focus(data: dict, targets: list[dict], assigned: dict[str, str], fallback_active: dict) -> tuple[bool, bool]:
+    attempted = False
+    active = data.get("activeWindow") or {}
+    if active:
+        saved_address = active.get("address") or ""
+        current_address = assigned.get(saved_address, "")
+        if not current_address and saved_address:
+            try:
+                live_addresses = {w.get("address") for w in raw_clients()}
+                if saved_address in live_addresses:
+                    current_address = saved_address
+            except Exception:
+                pass
+        if current_address:
+            attempted = True
+            if hypr("dispatch", "focuswindow", f"address:{current_address}", retries=2):
+                return True, attempted
+
+        active_key = active.get("restoreKey") or ""
+        if active_key:
+            for win in collect_windows():
+                if restore_key(win) == active_key:
+                    address = win.get("address") or ""
+                    if address:
+                        attempted = True
+                        if hypr("dispatch", "focuswindow", f"address:{address}", retries=2):
+                            return True, attempted
+                        break
+
+        ws = workspace_from_snapshot(active)
+        if ws:
+            attempted = True
+            if hypr("dispatch", "workspace", ws, retries=2):
+                return True, attempted
+
+    # Older session files did not record active focus. Preserve the user's
+    # pre-restore focus in that case so restore does not yank them around.
+    fallback_address = fallback_active.get("address") or ""
+    if fallback_address:
+        attempted = True
+        if hypr("dispatch", "focuswindow", f"address:{fallback_address}", retries=2):
+            return True, attempted
+    fallback_ws = workspace_from_snapshot(fallback_active)
+    if fallback_ws:
+        attempted = True
+        if hypr("dispatch", "workspace", fallback_ws, retries=2):
+            return True, attempted
+    return False, attempted
+
+
+def terminal_restore_argv(win: dict) -> list[str]:
+    restore_argv = safe_terminal_restore_argv(win.get("restoreArgv") or [])
+    if restore_argv:
+        return restore_argv
+
+    agent = win.get("agentSession") or {}
+    if agent.get("tool") == "pi" and agent.get("path"):
+        return [agent.get("command") or "pi", "--session", agent.get("path")]
+    if agent.get("tool") == "claude" and agent.get("command"):
+        command = agent.get("command")
+        session = agent.get("id") or ""
+        if session and session not in {"latest", "picker"}:
+            return [command, "--resume", session]
+        return [command, "--resume"] if session == "picker" else [command, "--continue"]
+    if agent.get("tool") == "codex":
+        command = agent.get("command") or "codex"
+        session = agent.get("id") or ""
+        if session and session not in {"latest", "picker"}:
+            return [command, "resume", session]
+        return [command, "resume"] if session == "picker" else [command, "resume", "--last"]
+
+    # Legacy saves made before a terminal class was supported may still have a
+    # useful title but no child-process restore metadata. Reopen the obvious
+    # agent in the saved cwd rather than dropping the user into an empty shell.
+    title = (win.get("title") or "").strip().lower()
+    if title.startswith("pi - "):
+        return ["pi", "--resume"]
+    if title.startswith("claude"):
+        return ["claude", "--resume"]
+    if title.startswith("codex"):
+        return ["codex", "resume"]
+    if title.startswith("opencode"):
+        return ["opencode"]
+    return []
+
+
+def terminal_exec_argv(restore_argv: list[str]) -> list[str]:
+    if not restore_argv:
+        return []
+
+    # Omarchy's Super+Return binding asks `omarchy-cmd-terminal-cwd` for the cwd
+    # of the active terminal. That helper intentionally trusts only a direct
+    # shell child of the terminal. If we launch `alacritty -e pi --session ...`,
+    # the terminal's direct child is `pi`, so Super+Return falls back to $HOME.
+    # Keep a shell as the direct child and run the restored command underneath it.
+    # The trailing exec also prevents bash from optimizing itself away into the
+    # final command, and leaves a useful shell if the restored agent exits.
+    return ["bash", "-lc", '"$@"; exec "${SHELL:-/bin/bash}" -l', "omarchy-session-restore", *restore_argv]
+
+
+def launch_command(win: dict) -> tuple[list[str] | None, str]:
+    cls = lc_class(win)
+    workdir = win.get("restoreWorkdir") or ""
+    webapp_url, webapp_flags = browser_app_args(win)
+    cmd: list[str] | None = None
+
+    if webapp_url and shutil.which("omarchy-launch-webapp"):
+        cmd = ["omarchy-launch-webapp", webapp_url, *webapp_flags]
+    elif cls in {"com.mitchellh.ghostty", "ghostty"}:
+        restore_argv = terminal_restore_argv(win)
+        cmd = ["ghostty"]
+        if workdir and Path(workdir).is_dir():
+            cmd.append(f"--working-directory={workdir}")
+        if restore_argv:
+            cmd.extend(["-e", *terminal_exec_argv(restore_argv)])
+    elif cls == "alacritty":
+        restore_argv = terminal_restore_argv(win)
+        cmd = ["alacritty"]
+        if workdir and Path(workdir).is_dir():
+            cmd.append(f"--working-directory={workdir}")
+        if restore_argv:
+            cmd.extend(["-e", *terminal_exec_argv(restore_argv)])
+    elif cls in {"chromium", "chromium-browser"}:
+        cmd = ["chromium", *browser_profile_args(win)]
+    elif cls in {"brave-browser", "brave"}:
+        cmd = ["brave", *browser_profile_args(win)]
+    elif cls in {"google-chrome", "google-chrome-stable"}:
+        cmd = ["google-chrome-stable", *browser_profile_args(win)]
+    elif cls in {"firefox", "firefoxdeveloperedition"}:
+        cmd = ["firefox", *browser_profile_args(win)]
+    elif cls in {"zen", "zen-browser", "zen-twilight", "app.zen_browser.zen"}:
+        cmd = [first_available_command(["zen-browser", "zen", "zen-twilight"]), *browser_profile_args(win)]
+    elif cls == "obsidian":
+        cmd = ["obsidian"]
+    elif cls == "slack":
+        cmd = ["slack"]
+    elif cls == "discord":
+        cmd = ["discord"]
+    elif cls in {"signal", "signal-desktop"}:
+        cmd = ["signal-desktop"]
+    elif cls in {"telegram-desktop", "org.telegram.desktop"}:
+        cmd = [first_available_command(["Telegram", "telegram-desktop"])]
+    elif cls in {"org.gnome.nautilus", "nautilus"}:
+        cmd = ["nautilus", "--new-window"]
+    elif cls == "thunderbird":
+        cmd = ["thunderbird"]
+    elif cls in {"keepassxc", "org.keepassxc.keepassxc"}:
+        cmd = ["keepassxc"]
+    elif cls in {"code", "code-url-handler", "visual-studio-code"}:
+        cmd = ["code", workdir] if workdir and Path(workdir).is_dir() else ["code"]
+
+    if not cmd:
+        return None, f"unknown app class: {win.get('class')} — {win.get('title')}"
+    if not shutil.which(cmd[0]):
+        return None, f"missing command for {win.get('class')}: {cmd[0]}"
+    return cmd, ""
+
+
+def launch_result(win: dict) -> str:
+    cmd, skip_reason = launch_command(win)
+    if not cmd:
+        print(f"Skipping {skip_reason}", file=sys.stderr)
+        return "skipped"
+
+    ws = workspace_spec(win)
+    if hypr_exec_on_workspace(cmd, ws):
+        return "launched"
+    if VERBOSE:
+        print(f"Launch dispatch failed: {window_summary(win)} -> {shlex.join(cmd)}", file=sys.stderr)
+    return "dispatch_failed"
+
+
+def launch(win: dict) -> bool:
+    return launch_result(win) == "launched"
+
+
+def planned_group_count(targets: list[dict]) -> int:
+    return len(saved_group_addresses(targets))
+
+
+def planned_focus_action(data: dict) -> str:
+    active = data.get("activeWindow") or {}
+    if not active:
+        return "would preserve current focus if possible (session has no saved active window)"
+    saved_address = active.get("address") or ""
+    if saved_address:
+        return f"would focus saved active window if matched: address:{saved_address}"
+    active_key = active.get("restoreKey") or ""
+    if active_key:
+        return f"would focus first window matching saved restore key: {active_key}"
+    ws = workspace_from_snapshot(active)
+    if ws:
+        return f"would switch to saved active workspace: {ws}"
+    return "would preserve current focus if possible"
+
+
+def window_summary(win: dict) -> str:
+    title = win.get("title") or ""
+    title_part = f" — {title}" if title else ""
+    return f"workspace {workspace_spec(win)}: {win.get('class')}{title_part}"
+
+
+def audit_window_record(win: dict) -> dict:
+    record = {
+        "address": win.get("address") or "",
+        "class": win.get("class") or "",
+        "title": win.get("title") or "",
+        "workspace": win.get("workspace") or {},
+        "workspaceSpec": workspace_spec(win),
+        "monitor": win.get("monitor"),
+        "monitorName": win.get("monitorName") or "",
+        "restoreKey": restore_key(win),
+        "grouped": win.get("grouped") or [],
+        "groupIndex": win.get("groupIndex", 0),
+        "groupSize": win.get("groupSize", 0),
+    }
+    if win.get("restoreWorkdir"):
+        record["restoreWorkdir"] = win.get("restoreWorkdir")
+    if win.get("restoreArgv"):
+        record["restoreArgv"] = win.get("restoreArgv")
+    if win.get("agentSession"):
+        record["agentSession"] = win.get("agentSession")
+    if browser_profile_args(win):
+        record["browserProfileArgs"] = browser_profile_args(win)
+    return record
+
+
+def monitor_audit_value(win: dict) -> str:
+    if win.get("monitorName"):
+        return str(win.get("monitorName"))
+    monitor = win.get("monitor")
+    return str(monitor) if monitor is not None else ""
+
+
+def target_outcome_record(
+    win: dict,
+    status: str,
+    *,
+    current_address: str = "",
+    detail: str = "",
+    dispatch_failures: int = 0,
+) -> dict:
+    record = {
+        "savedAddress": win.get("address") or "",
+        "restoreKey": restore_key(win),
+        "status": status,
+        "target": audit_window_record(win),
+    }
+    if current_address:
+        record["currentAddress"] = current_address
+    if detail:
+        record["detail"] = detail
+    if dispatch_failures:
+        record["dispatchFailures"] = dispatch_failures
+    return record
+
+
+def outcome_by_saved_address(target_outcomes: list[dict]) -> dict[str, dict]:
+    return {o.get("savedAddress") or "": o for o in target_outcomes if o.get("savedAddress")}
+
+
+def restore_verification(
+    targets: list[dict],
+    before_windows: list[dict],
+    after_windows: list[dict],
+    group_assessments: list[dict],
+    focus_restored: bool,
+    focus_attempted: bool,
+    target_outcomes: list[dict] | None = None,
+) -> dict:
+    assigned = assign_current_addresses(
+        targets,
+        after_windows,
+        preferred=current_addresses_from_outcomes(target_outcomes),
+    )
+    after_by_address = {w.get("address") or "": w for w in after_windows if w.get("address")}
+    before_addresses = {w.get("address") or "" for w in before_windows if w.get("address")}
+    matched_current_addresses: set[str] = set()
+    matched_targets = []
+    missing_targets = []
+    unsupported_duplicate_singletons = []
+    workspace_mismatches = []
+    monitor_mismatches = []
+    outcomes_by_address = outcome_by_saved_address(target_outcomes or [])
+
+    for target in targets:
+        saved_address = target.get("address") or ""
+        target_record = audit_window_record(target)
+        current_address = assigned.get(saved_address, "")
+        actual = after_by_address.get(current_address, {}) if current_address else {}
+        if not actual:
+            outcome = outcomes_by_address.get(saved_address, {})
+            if outcome.get("status") == "duplicate_singleton_unsupported":
+                unsupported_duplicate_singletons.append(target_record)
+            else:
+                missing_targets.append(target_record)
+            continue
+
+        matched_current_addresses.add(current_address)
+        actual_record = audit_window_record(actual)
+        matched_targets.append({
+            "savedAddress": saved_address,
+            "currentAddress": current_address,
+            "target": target_record,
+            "actual": actual_record,
+        })
+
+        target_ws = workspace_spec(target)
+        actual_ws = workspace_spec(actual)
+        if target_ws and actual_ws and target_ws != actual_ws:
+            workspace_mismatches.append({
+                "savedAddress": saved_address,
+                "currentAddress": current_address,
+                "expected": target_ws,
+                "actual": actual_ws,
+                "target": target_record,
+                "actualWindow": actual_record,
+            })
+
+        target_monitor = monitor_audit_value(target)
+        actual_monitor = monitor_audit_value(actual)
+        if target_monitor and actual_monitor and target_monitor != actual_monitor:
+            monitor_mismatches.append({
+                "savedAddress": saved_address,
+                "currentAddress": current_address,
+                "expected": target_monitor,
+                "actual": actual_monitor,
+                "target": target_record,
+                "actualWindow": actual_record,
+            })
+
+    extra_new_windows = [
+        audit_window_record(win)
+        for win in after_windows
+        if (win.get("address") or "") not in before_addresses
+        and (win.get("address") or "") not in matched_current_addresses
+    ]
+    group_counts = dict(group_status_counts(group_assessments, ["correct", "partial_missing", "failed", "cannot_assess"]))
+    focus_failed = focus_attempted and not focus_restored
+    matched_well_enough = not (
+        missing_targets
+        or workspace_mismatches
+        or monitor_mismatches
+        or group_counts.get("partial_missing", 0)
+        or group_counts.get("failed", 0)
+        or group_counts.get("cannot_assess", 0)
+        or unsupported_duplicate_singletons
+        or focus_failed
+    )
+
+    return {
+        "matchedWellEnough": matched_well_enough,
+        "targetCount": len(targets),
+        "matchedCount": len(matched_targets),
+        "missingCount": len(missing_targets),
+        "unsupportedDuplicateSingletonCount": len(unsupported_duplicate_singletons),
+        "extraNewWindowCount": len(extra_new_windows),
+        "workspaceMismatchCount": len(workspace_mismatches),
+        "monitorMismatchCount": len(monitor_mismatches),
+        "matchedTargets": matched_targets,
+        "missingTargets": missing_targets,
+        "unsupportedDuplicateSingletonTargets": unsupported_duplicate_singletons,
+        "extraNewWindows": extra_new_windows,
+        "workspaceMismatches": workspace_mismatches,
+        "monitorMismatches": monitor_mismatches,
+        "groups": {
+            "counts": group_counts,
+            "details": group_assessments,
+        },
+        "focus": {
+            "attempted": focus_attempted,
+            "restored": focus_restored,
+            "failed": focus_failed,
+        },
+    }
+
+
+def write_restore_audit(
+    source: Path,
+    before_windows: list[dict],
+    before_active: dict,
+    targets: list[dict],
+    after_windows: list[dict],
+    after_active: dict,
+    launched_windows: list[dict],
+    summary: dict,
+    group_assessments: list[dict],
+    focus_restored: bool,
+    focus_attempted: bool,
+    target_outcomes: list[dict] | None = None,
+) -> tuple[Path | None, dict]:
+    target_outcomes = target_outcomes or []
+    verification = restore_verification(
+        targets, before_windows, after_windows, group_assessments, focus_restored, focus_attempted, target_outcomes
+    )
+    data = {
+        "restoredAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source": str(source),
+        "summary": summary,
+        "before": {
+            "activeWindow": before_active,
+            "windowCount": len(before_windows),
+            "windows": before_windows,
+        },
+        "intended": {
+            "targetCount": len(targets),
+            "targets": [audit_window_record(w) for w in targets],
+        },
+        "after": {
+            "activeWindow": after_active,
+            "windowCount": len(after_windows),
+            "windows": after_windows,
+        },
+        "launched": launched_windows,
+        "targetOutcomes": target_outcomes,
+        "verification": verification,
+    }
+    try:
+        LAST_RESTORE_AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = LAST_RESTORE_AUDIT_FILE.with_suffix(LAST_RESTORE_AUDIT_FILE.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        tmp.replace(LAST_RESTORE_AUDIT_FILE)
+        return LAST_RESTORE_AUDIT_FILE, verification
+    except Exception as exc:
+        if VERBOSE:
+            print(f"Restore audit not saved: {exc}", file=sys.stderr)
+        return None, verification
+
+
+def restore_review_note(verification: dict) -> str:
+    if not verification or verification.get("matchedWellEnough"):
+        return ""
+    groups = (verification.get("groups") or {}).get("counts") or {}
+    parts = []
+    checks = [
+        ("missing", verification.get("missingCount", 0)),
+        ("duplicate singleton unsupported", verification.get("unsupportedDuplicateSingletonCount", 0)),
+        ("workspace mismatches", verification.get("workspaceMismatchCount", 0)),
+        ("monitor mismatches", verification.get("monitorMismatchCount", 0)),
+        ("group partial/missing", groups.get("partial_missing", 0)),
+        ("group failed", groups.get("failed", 0)),
+        ("group cannot assess", groups.get("cannot_assess", 0)),
+    ]
+    for label, count in checks:
+        if count:
+            parts.append(f"{label} {count}")
+    focus = verification.get("focus") or {}
+    if focus.get("failed"):
+        parts.append("focus failed")
+    detail = ", ".join(parts) if parts else "see audit"
+    return f", restore needs review: {detail}"
+
+
+def parse_number_selection(value: str, label: str) -> set[int]:
+    selected: set[int] = set()
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_text, end_text = part.split("-", 1)
+            if not start_text.isdigit() or not end_text.isdigit():
+                raise ValueError(f"Invalid {label} range: {part}")
+            start, end = int(start_text), int(end_text)
+            if start < 1 or end < start:
+                raise ValueError(f"Invalid {label} range: {part}")
+            selected.update(range(start, end + 1))
+        elif part.isdigit() and int(part) >= 1:
+            selected.add(int(part))
+        else:
+            raise ValueError(f"Invalid {label}: {part}")
+    if not selected:
+        raise ValueError(f"Missing {label} value")
+    return selected
+
+
+def parse_workspace_selection(value: str) -> set[str]:
+    selected = {part.strip() for part in value.split(",") if part.strip()}
+    if not selected:
+        raise ValueError("Missing workspace value")
+    return selected
+
+
+def restore_items(data: dict) -> list[dict]:
+    return [w for w in data.get("windows", []) if workspace_spec(w) != "0"]
+
+
+def restore_group_members(targets: list[dict]) -> list[tuple[str, ...]]:
+    return saved_group_addresses(targets)
+
+
+def select_restore_targets(data: dict, selection: dict | None = None) -> tuple[list[dict], int]:
+    all_targets = [dict(win, _restoreItemIndex=index) for index, win in enumerate(restore_items(data), 1)]
+    if not selection or not any(selection.get(key) for key in ("workspaces", "groups", "items")):
+        return all_targets, len(all_targets)
+
+    selected_addresses: set[str] = set()
+    workspaces = {str(value) for value in selection.get("workspaces", set())}
+    item_indexes = set(selection.get("items", set()))
+    group_indexes = set(selection.get("groups", set()))
+
+    for index, win in enumerate(all_targets, 1):
+        if index in item_indexes or workspace_spec(win) in workspaces:
+            address = win.get("address") or ""
+            if address:
+                selected_addresses.add(address)
+
+    groups = restore_group_members(all_targets)
+    for group_index in group_indexes:
+        if group_index < 1 or group_index > len(groups):
+            raise ValueError(f"Group index out of range: {group_index}")
+        selected_addresses.update(groups[group_index - 1])
+
+    invalid_items = sorted(index for index in item_indexes if index > len(all_targets))
+    if invalid_items:
+        raise ValueError(f"Item index out of range: {invalid_items[0]}")
+    known_workspaces = {workspace_spec(win) for win in all_targets}
+    unknown_workspaces = sorted(workspaces - known_workspaces)
+    if unknown_workspaces:
+        raise ValueError(f"Workspace not found in save: {unknown_workspaces[0]}")
+
+    selected: list[dict] = []
+    for win in all_targets:
+        address = win.get("address") or ""
+        if address not in selected_addresses:
+            continue
+        copied = dict(win)
+        grouped = tuple(win.get("grouped") or [])
+        if grouped and not set(grouped).issubset(selected_addresses):
+            copied["grouped"] = []
+            copied["groupIndex"] = 0
+            copied["groupSize"] = 0
+        selected.append(copied)
+    return selected, len(all_targets)
+
+
+def selected_restore_data(data: dict, targets: list[dict], *, partial: bool = True) -> dict:
+    selected = dict(data)
+    selected["windows"] = targets
+    active = data.get("activeWindow") or {}
+    selected_addresses = {win.get("address") or "" for win in targets}
+    if partial and (active.get("address") or "") not in selected_addresses:
+        selected["activeWindow"] = {}
+    return selected
+
+
+def restore_dry_run(path: Path, selection: dict | None = None) -> None:
+    data = load_session(path)
+    try:
+        targets, total_targets = select_restore_targets(data, selection)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(2)
+    data = selected_restore_data(data, targets, partial=len(targets) != total_targets)
+    current_windows = collect_windows()
+    existing_matches = match_existing_windows(targets, current_windows)
+    monitor_moves = workspace_monitor_moves(targets, current_windows)
+    duplicate_singletons = duplicate_singleton_addresses(targets)
+    launched = 0
+    skipped_open = 0
+    skipped_unknown = 0
+    duplicate_singletons_unsupported = 0
+    planned_actions: dict[str, str] = {}
+
+    print(f"Restore dry-run{f' for {human_path(path)}' if VERBOSE else ''}")
+    selection_note = f" selected from {total_targets}" if len(targets) != total_targets else ""
+    print(f"Saved windows considered: {len(targets)}{selection_note}; current windows: {len(current_windows)}")
+    if monitor_moves:
+        print("Monitor actions:")
+        for ws, monitor in monitor_moves:
+            print(f"  would move workspace {ws} to monitor {monitor}")
+    else:
+        print("Monitor actions: none")
+
+    print("Window actions:")
+    if not targets:
+        print("  none")
+    for win in targets:
+        key = restore_key(win)
+        label = f"{window_summary(win)} [item {win.get('_restoreItemIndex')}]"
+        address = win.get("address") or ""
+        if address in duplicate_singletons:
+            duplicate_singletons_unsupported += 1
+            if address:
+                planned_actions[address] = "duplicate_singleton_unsupported"
+            print(f"  unsupported duplicate singleton: {label} ({key})")
+            continue
+        if address in existing_matches:
+            skipped_open += 1
+            planned_actions[address] = "already_open"
+            print(f"  already open: {label}")
+            continue
+
+        cmd, skip_reason = launch_command(win)
+        if cmd:
+            launched += 1
+            if address:
+                planned_actions[address] = "would_launch"
+            print(f"  would launch: {label} -> {shlex.join(cmd)}")
+        else:
+            skipped_unknown += 1
+            if address:
+                planned_actions[address] = "skipped"
+            print(f"  skipped: {label} ({skip_reason})")
+
+    group_assessments = assess_dry_run_groups(targets, current_windows, planned_actions)
+    group_count = len(group_assessments)
+    if group_count:
+        counts = group_status_counts(group_assessments, ["already_correct", "would_regroup", "partial_missing", "cannot_assess"])
+        print(
+            "Group actions: "
+            f"{group_count} saved group(s): "
+            f"already correct {counts['already_correct']}, "
+            f"would regroup {counts['would_regroup']}, "
+            f"partial/missing {counts['partial_missing']}, "
+            f"cannot assess {counts['cannot_assess']}"
+        )
+        print_verbose_group_details(group_assessments)
+    else:
+        print("Group actions: none")
+    print(f"Focus actions: {planned_focus_action(data)}")
+    monitor_note = f", monitor placements {len(monitor_moves)}" if monitor_moves else ""
+    if group_count:
+        group_summary = (
+            f", saved groups {group_count} "
+            f"(already correct {counts['already_correct']}, would regroup {counts['would_regroup']}, "
+            f"partial/missing {counts['partial_missing']}, cannot assess {counts['cannot_assess']})"
+        )
+    else:
+        group_summary = ", saved groups 0"
+    duplicate_note = f", duplicate singleton unsupported {duplicate_singletons_unsupported}" if duplicate_singletons_unsupported else ""
+    print(f"Dry-run checked {len(targets)} saved windows: would launch {launched}, already open {skipped_open}, skipped {skipped_unknown}{duplicate_note}{group_summary}{monitor_note}")
+
+
+def write_last_restore(source: Path, launched_windows: list[dict]) -> None:
+    LAST_RESTORE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "restoredAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source": str(source),
+        "launched": launched_windows,
+    }
+    tmp = LAST_RESTORE_FILE.with_suffix(LAST_RESTORE_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(LAST_RESTORE_FILE)
+
+
+def hard_undo() -> None:
+    if not LAST_RESTORE_FILE.exists():
+        print(f"No restore launch record found at {LAST_RESTORE_FILE}")
+        return
+    data = load_session(LAST_RESTORE_FILE)
+    launched = data.get("launched") or []
+    if not launched:
+        print("Last restore did not launch any windows; nothing to close")
+        return
+    live_addresses = {w.get("address") for w in raw_clients()}
+    closed = 0
+    missing = 0
+    for item in launched:
+        address = item.get("address") or ""
+        if not address or address not in live_addresses:
+            missing += 1
+            continue
+        hypr("dispatch", "closewindow", f"address:{address}")
+        closed += 1
+        time.sleep(0.1)
+    print(f"Hard undo closed {closed} windows from last restore; missing/already closed {missing}")
+    notify("Omarchy hard undo", f"Closed {closed}; missing {missing}")
+
+
+def restore(path: Path, *, save_undo: bool = True, selection: dict | None = None) -> None:
+    data = load_session(path)
+    try:
+        targets, total_targets = select_restore_targets(data, selection)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(2)
+    data = selected_restore_data(data, targets, partial=len(targets) != total_targets)
+
+    if save_undo:
+        write_session(UNDO_FILE, quiet=True)
+        print(f"Stored pre-restore state{f' at {human_path(UNDO_FILE)}' if VERBOSE else ''}")
+
+    fallback_active = active_window()
+    current_windows = collect_windows()
+    before_active = active_session_snapshot(current_windows)
+    before_addresses = {w.get("address") or "" for w in current_windows}
+    existing_matches = match_existing_windows(targets, current_windows)
+    duplicate_singletons = duplicate_singleton_addresses(targets)
+    monitors_restored, monitor_failures = restore_workspace_monitors(targets)
+    launched = 0
+    skipped_open = 0
+    skipped_unknown = 0
+    duplicate_singletons_unsupported = 0
+    launch_dispatch_failed = 0
+    launched_undetected = 0
+    state_dispatch_failed = 0
+    groups_restored = 0
+    launched_windows: list[dict] = []
+    target_outcomes: list[dict] = []
+
+    for win in targets:
+        saved_address = win.get("address") or ""
+        if saved_address in duplicate_singletons:
+            duplicate_singletons_unsupported += 1
+            target_outcomes.append(target_outcome_record(
+                win,
+                "duplicate_singleton_unsupported",
+                detail="multiple saved singleton app targets share one restore key; this app may reuse an existing window/tab",
+            ))
+            continue
+        if saved_address in existing_matches:
+            skipped_open += 1
+            target_outcomes.append(target_outcome_record(
+                win, "already_open", current_address=existing_matches[saved_address].get("address") or ""
+            ))
+            continue
+        launch_status = launch_result(win)
+        if launch_status == "launched":
+            launched += 1
+            address, dispatch_failures = apply_saved_state(win, before_addresses)
+            state_dispatch_failed += dispatch_failures
+            if address:
+                launched_windows.append({
+                    "address": address,
+                    "class": win.get("class"),
+                    "title": win.get("title"),
+                    "workspace": workspace_spec(win),
+                    "restoreKey": restore_key(win),
+                })
+                target_outcomes.append(target_outcome_record(
+                    win, "launched_detected", current_address=address, dispatch_failures=dispatch_failures
+                ))
+            else:
+                launched_undetected += 1
+                target_outcomes.append(target_outcome_record(
+                    win, "launched_undetected", dispatch_failures=dispatch_failures
+                ))
+            time.sleep(0.35)
+        elif launch_status == "dispatch_failed":
+            launch_dispatch_failed += 1
+            target_outcomes.append(target_outcome_record(win, "dispatch_failed"))
+        else:
+            skipped_unknown += 1
+            _, skip_reason = launch_command(win)
+            if is_unknown_app_reason(skip_reason):
+                log_unknown_app_class(win, path)
+            target_outcomes.append(target_outcome_record(win, "skipped", detail=skip_reason))
+
+    groups_restored, assigned = restore_groups(targets, target_outcomes)
+    group_assessments = verify_saved_groups(targets, assigned)
+    group_count = len(group_assessments)
+    if group_count:
+        group_counts = group_status_counts(group_assessments, ["correct", "partial_missing", "failed", "cannot_assess"])
+        print_verbose_group_details(group_assessments)
+        group_note = (
+            f", groups actively restored {groups_restored}, "
+            f"groups verified correct {group_counts['correct']}/{group_count}, "
+            f"partial/missing {group_counts['partial_missing']}, "
+            f"failed {group_counts['failed']}, "
+            f"cannot assess {group_counts['cannot_assess']}"
+        )
+    else:
+        group_counts = Counter()
+        group_note = ", saved groups 0"
+    focus_restored, focus_attempted = restore_saved_focus(data, targets, assigned, fallback_active)
+    if focus_restored:
+        focus_note = ", focus restored"
+    elif focus_attempted:
+        focus_note = ", focus restore failed"
+    else:
+        focus_note = ""
+    write_last_restore(path, launched_windows)
+    monitor_parts = []
+    if monitors_restored:
+        monitor_parts.append(f"monitor placements {monitors_restored}")
+    if monitor_failures:
+        monitor_parts.append(f"monitor placement failures {monitor_failures}")
+    monitor_note = f", {', '.join(monitor_parts)}" if monitor_parts else ""
+    launch_note = ""
+    launch_issues = []
+    if launch_dispatch_failed:
+        launch_issues.append(f"launch dispatch failed {launch_dispatch_failed}")
+    if launched_undetected:
+        launch_issues.append(f"launched undetected {launched_undetected}")
+    if duplicate_singletons_unsupported:
+        launch_issues.append(f"duplicate singleton unsupported {duplicate_singletons_unsupported}")
+    if state_dispatch_failed:
+        launch_issues.append(f"state dispatch failures {state_dispatch_failed}")
+    if launch_issues:
+        launch_note = f", {', '.join(launch_issues)}"
+
+    try:
+        after_windows = collect_windows()
+        after_active = active_session_snapshot(after_windows)
+    except Exception:
+        after_windows = []
+        after_active = {}
+    summary = {
+        "targetCount": len(targets),
+        "savedTargetCount": total_targets,
+        "partialRestore": len(targets) != total_targets,
+        "launched": launched,
+        "alreadyOpen": skipped_open,
+        "skipped": skipped_unknown,
+        "duplicateSingletonUnsupported": duplicate_singletons_unsupported,
+        "launchDispatchFailed": launch_dispatch_failed,
+        "launchedUndetected": launched_undetected,
+        "stateDispatchFailures": state_dispatch_failed,
+        "groupsActivelyRestored": groups_restored,
+        "groupCount": group_count,
+        "groupCounts": dict(group_counts),
+        "monitorPlacements": monitors_restored,
+        "monitorPlacementFailures": monitor_failures,
+        "focusRestored": focus_restored,
+        "focusAttempted": focus_attempted,
+    }
+    audit_result = write_restore_audit(
+        path,
+        current_windows,
+        before_active,
+        targets,
+        after_windows,
+        after_active,
+        launched_windows,
+        summary,
+        group_assessments,
+        focus_restored,
+        focus_attempted,
+        target_outcomes,
+    )
+    if isinstance(audit_result, tuple):
+        audit_path, verification = audit_result
+    else:
+        audit_path = audit_result
+        verification = {}
+    audit_note = ""
+    if audit_path:
+        audit_note = f", audit saved{f' at {human_path(audit_path)}' if VERBOSE else ''}"
+    review_note = restore_review_note(verification)
+    print(f"Restore checked {len(targets)} saved windows: launched {launched}, already open {skipped_open}, skipped {skipped_unknown}{launch_note}{group_note}{monitor_note}{focus_note}{review_note}{audit_note}")
+    notify("Omarchy session restore", f"Launched {launched}; already open {skipped_open}; groups correct {group_counts.get('correct', 0)}/{group_count}")
+
+
+def session_choices() -> list[tuple[str, Path]]:
+    choices: list[tuple[str, Path]] = [("default", SESSION_FILE)]
+    if PROFILE_DIR.exists():
+        for path in sorted(PROFILE_DIR.glob("*.json")):
+            choices.append((f"profile: {path.stem}", path))
+    if LATEST_AUTOSAVE.exists() or LATEST_AUTOSAVE.is_symlink():
+        choices.append(("autosave: latest", LATEST_AUTOSAVE))
+    if AUTOSAVE_DIR.exists():
+        autosaves = sorted((p for p in AUTOSAVE_DIR.glob("*.json") if p.name != "latest.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in autosaves[:20]:
+            choices.append((f"autosave: {path.stem}", path))
+    return choices
+
+
+def list_profiles() -> None:
+    for label, path in session_choices():
+        summary = session_file_summary(path)
+        if VERBOSE:
+            print(f"{label}\t{summary}\t{human_path(path)}")
+        else:
+            print(f"{label}: {summary}")
+
+
+def run_menu(labels: list[str], prompt: str) -> str:
+    menu_cmds = [
+        ["walker", "--dmenu", "--exit", "--placeholder", prompt],
+        ["wofi", "--dmenu", "--prompt", prompt],
+        ["fuzzel", "--dmenu", "--prompt", f"{prompt}: "],
+        ["rofi", "-dmenu", "-p", prompt],
+    ]
+    for cmd in menu_cmds:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            result = subprocess.run(cmd, input="\n".join(labels) + "\n", text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except Exception:
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().splitlines()[-1]
+        if result.returncode != 0:
+            return ""
+
+    if sys.stdin.isatty():
+        for i, label in enumerate(labels, 1):
+            print(f"{i:2d}. {label}")
+        answer = input(f"{prompt} [1-{len(labels)}]: ").strip()
+        if answer.isdigit() and 1 <= int(answer) <= len(labels):
+            return labels[int(answer) - 1]
+    else:
+        for i, label in enumerate(labels, 1):
+            print(f"{i}\t{label}")
+    return ""
+
+
+def run_input(prompt: str) -> str:
+    commands = [
+        ["omarchy-menu-input", prompt],
+        ["walker", "--dmenu", "--inputonly", "--width", "360", "--minheight", "1", "--maxheight", "1", "-p", f"{prompt}…"],
+    ]
+    for command in commands:
+        if not shutil.which(command[0]):
+            continue
+        try:
+            result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except Exception:
+            continue
+        if result.returncode == 0:
+            return result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+        return ""
+    if sys.stdin.isatty():
+        return input(f"{prompt}: ").strip()
+    return ""
+
+
+def session_picker_mtime(path: Path) -> float:
+    try:
+        if path.exists() or path.is_symlink():
+            return path.stat().st_mtime
+    except Exception:
+        pass
+    return -1
+
+
+def pick_session_path(prompt: str = "ws pick") -> Path:
+    choices = session_choices()
+    if not choices:
+        print("No sessions found", file=sys.stderr)
+        sys.exit(1)
+    choices = sorted(choices, key=lambda choice: session_picker_mtime(choice[1]), reverse=True)
+    menu_choices = [(f"{label} — {session_picker_summary(path)}", path) for label, path in choices]
+    picked = run_menu([label for label, _ in menu_choices], prompt)
+    if not picked:
+        print("No session selected", file=sys.stderr)
+        sys.exit(1)
+    path = dict(menu_choices).get(picked)
+    if not path:
+        print(f"Unknown selection: {picked}", file=sys.stderr)
+        sys.exit(1)
+    return path
+
+
+def pick_session(action: str = "restore") -> None:
+    path = pick_session_path(f"ws {action}")
+    if action in {"restore", "r", "start"}:
+        restore(path, save_undo=True)
+    elif action in {"select", "partial", "rs"}:
+        partial_restore_picker(path)
+    elif action in {"plan", "preview", "dry-run"}:
+        restore_dry_run(path)
+    elif action in {"list", "l", "show"}:
+        list_session(path)
+    elif action in {"path", "p"}:
+        print(path)
+    else:
+        print(f"Unsupported pick action: {action}", file=sys.stderr)
+        sys.exit(1)
+
+
+def partial_item_label(win: dict, index: int, selected: bool) -> str:
+    mark = "x" if selected else " "
+    title = (win.get("title") or "").strip() or "(untitled)"
+    cls = win.get("class") or "(unknown)"
+    agent = win.get("agentSession") or {}
+    agent_note = f" · {agent.get('tool')} session" if agent.get("tool") else ""
+    return f"[{mark}] item {index} · ws {workspace_spec(win)} · {cls} · {title}{agent_note}"
+
+
+def toggle_scope_picker(kind: str, targets: list[dict], selected: set[int]) -> None:
+    scopes: dict[str, set[int]] = {}
+    if kind == "workspace":
+        for index, win in enumerate(targets, 1):
+            scopes.setdefault(workspace_spec(win), set()).add(index)
+    else:
+        address_to_item = {win.get("address"): index for index, win in enumerate(targets, 1)}
+        for group_index, addresses in enumerate(restore_group_members(targets), 1):
+            scopes[str(group_index)] = {address_to_item[address] for address in addresses if address in address_to_item}
+    if not scopes:
+        return
+    labels = []
+    mapping: dict[str, set[int]] = {}
+    for scope, indexes in sorted(
+        scopes.items(), key=lambda item: (0, int(item[0])) if item[0].isdigit() else (1, item[0])
+    ):
+        selected_count = len(indexes & selected)
+        label = f"{kind} {scope} · {selected_count}/{len(indexes)} selected"
+        labels.append(label)
+        mapping[label] = indexes
+    picked = run_menu(labels, f"Toggle {kind}")
+    indexes = mapping.get(picked, set())
+    if not indexes:
+        return
+    if indexes.issubset(selected):
+        selected.difference_update(indexes)
+    else:
+        selected.update(indexes)
+
+
+def partial_restore_picker(path: Path) -> None:
+    data = load_session(path)
+    targets = restore_items(data)
+    if not targets:
+        print("Selected save has no restorable windows", file=sys.stderr)
+        return
+    selected: set[int] = set()
+    while True:
+        item_labels = [partial_item_label(win, index, index in selected) for index, win in enumerate(targets, 1)]
+        actions = [
+            f"Restore selected ({len(selected)})",
+            f"Plan selected ({len(selected)})",
+            "Toggle workspace…",
+            "Toggle group…",
+            "Select all",
+            "Clear selection",
+            "Cancel",
+        ]
+        picked = run_menu(item_labels + actions, "Partial restore")
+        if not picked or picked == "Cancel":
+            return
+        if picked in item_labels:
+            index = item_labels.index(picked) + 1
+            if index in selected:
+                selected.remove(index)
+            else:
+                selected.add(index)
+            continue
+        if picked == "Toggle workspace…":
+            toggle_scope_picker("workspace", targets, selected)
+            continue
+        if picked == "Toggle group…":
+            toggle_scope_picker("group", targets, selected)
+            continue
+        if picked == "Select all":
+            selected = set(range(1, len(targets) + 1))
+            continue
+        if picked == "Clear selection":
+            selected.clear()
+            continue
+        if not selected:
+            print("No windows selected", file=sys.stderr)
+            continue
+        selection = {"items": set(selected), "workspaces": set(), "groups": set()}
+        if picked.startswith("Plan selected"):
+            restore_dry_run(path, selection)
+            return
+        if picked.startswith("Restore selected"):
+            restore(path, save_undo=True, selection=selection)
+            return
+
+
+def open_command_terminal(*args: str) -> None:
+    # Desktop launchers may set argv[0] to only `omarchy-session`, which makes
+    # Path(sys.argv[0]).resolve() point at a nonexistent file under the launcher's
+    # working directory. __file__ always identifies the installed/source script.
+    command = str(Path(__file__).resolve())
+    if shutil.which("xdg-terminal-exec"):
+        # Alacritty's desktop entry does not implement xdg-terminal-exec's
+        # optional --hold action. Keep the terminal open portably with a shell
+        # prompt after the read-only command finishes.
+        script = '"$@"; status=$?; printf "\\nPress Enter to close…"; read -r _; exit "$status"'
+        subprocess.Popen([
+            "xdg-terminal-exec", "--title=Omarchy Session", "--",
+            "bash", "-lc", script, "omarchy-session-menu", command, *args,
+        ], start_new_session=True)
+    else:
+        subprocess.Popen([command, *args], start_new_session=True)
+
+
+def save_workspace_picker() -> None:
+    windows = collect_windows()
+    counts = Counter(workspace_spec(win) for win in windows if workspace_spec(win) != "0")
+    if not counts:
+        notify("Omarchy session", "No workspace windows found")
+        return
+    labels: list[str] = []
+    mapping: dict[str, str] = {}
+    for workspace, count in sorted(
+        counts.items(), key=lambda item: (0, int(item[0])) if item[0].isdigit() else (1, item[0])
+    ):
+        label = f"Workspace {workspace} · {plural(count, 'window')}"
+        labels.append(label)
+        mapping[label] = workspace
+    picked = run_menu(labels, "Save workspace")
+    workspace = mapping.get(picked, "")
+    if not workspace:
+        return
+    name = run_input(f"Profile name for workspace {workspace}")
+    if not name:
+        return
+    try:
+        write_session(session_path(name), workspaces={workspace})
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        notify("Omarchy session save failed", str(exc))
+
+
+def session_action_menu() -> None:
+    options = [
+        "󰆓  Save current layout",
+        "󰉋  Save one workspace as profile…",
+        "󰑓  Restore default",
+        "󰩭  Restore selected…",
+        "󰍉  Choose profile or autosave…",
+        "󰋼  Preview restore plan…",
+        "󰆓  Autosave now",
+        "󰕌  Undo last restore",
+        "󰕌  Hard undo launched windows",
+        "󰋽  Status",
+        "󰒋  Dependency check",
+        "Cancel",
+    ]
+    picked = run_menu(options, "Workspace sessions")
+    if not picked or picked == "Cancel":
+        return
+    if "Save current" in picked:
+        write_session(SESSION_FILE)
+    elif "Save one workspace" in picked:
+        save_workspace_picker()
+    elif "Restore default" in picked:
+        restore(SESSION_FILE, save_undo=True)
+    elif "Restore selected" in picked:
+        partial_restore_picker(pick_session_path("Select saved session"))
+    elif "Choose profile" in picked:
+        pick_session("restore")
+    elif "Preview restore plan" in picked:
+        path = pick_session_path("Preview saved session")
+        open_command_terminal("plan-path", str(path))
+    elif "Autosave" in picked:
+        path = autosave_once(quiet=True)
+        notify("Omarchy session autosave", session_file_summary(path))
+    elif "Hard undo" in picked:
+        confirm = run_menu(["Close windows launched by the last restore", "Cancel"], "Confirm hard undo")
+        if confirm.startswith("Close windows"):
+            hard_undo()
+    elif "Undo last" in picked:
+        restore(UNDO_FILE, save_undo=False)
+    elif "Status" in picked:
+        open_command_terminal("status")
+    elif "Dependency" in picked:
+        open_command_terminal("deps")
+
+
+def count_session_windows(path: Path) -> str:
+    if not path.exists() and not path.is_symlink():
+        return "missing"
+    try:
+        data = load_session(path)
+        return str(len(data.get("windows", [])))
+    except Exception:
+        return "unreadable"
+
+
+def file_age(path: Path) -> str:
+    if not path.exists() and not path.is_symlink():
+        return "missing"
+    try:
+        seconds = max(0, int(time.time() - path.stat().st_mtime))
+    except Exception:
+        return "unknown"
+    if seconds < 90:
+        return f"{seconds}s ago"
+    minutes = seconds // 60
+    if minutes < 90:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
+
+def is_autosave_loop_pid(pid: int) -> bool:
+    argv = read_proc_argv(pid)
+    joined = " ".join(argv)
+    return "omarchy-session" in joined and "autosave-loop" in joined
+
+
+def autosave_loop_status() -> str:
+    pid_file = STATE_DIR / "autosave-loop.pid"
+    if not pid_file.exists():
+        return "not running (no pid file)"
+    try:
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, 0)
+        if is_autosave_loop_pid(pid):
+            return f"running pid {pid}"
+        return f"stale pid file ({pid_file}; pid {pid} is not autosave-loop)"
+    except Exception:
+        return f"stale pid file ({pid_file})"
+
+
+def modmask_label(modmask: int) -> str:
+    parts: list[str] = []
+    for bit, name in ((64, "Super"), (1, "Shift"), (4, "Ctrl"), (8, "Alt")):
+        if modmask & bit:
+            parts.append(name)
+    return "+".join(parts)
+
+
+def session_shortcuts() -> list[str]:
+    try:
+        raw = subprocess.check_output(["hyprctl", "binds", "-j"], text=True, stderr=subprocess.DEVNULL)
+        binds = json.loads(raw)
+    except Exception:
+        binds = []
+
+    rows: list[tuple[str, str, str]] = []
+    for bind in binds:
+        arg = bind.get("arg") or ""
+        if not re.search(r"(^|\s|/)(omarchy-session|ws|restore-workspace)(\s|$)", arg):
+            continue
+        key = bind.get("key") or (f"code:{bind.get('keycode')}" if bind.get("keycode") else "")
+        combo = "+".join(part for part in (modmask_label(int(bind.get("modmask") or 0)), key) if part)
+        description = bind.get("description") or "workspace session"
+        rows.append((combo, description, arg))
+
+    if not rows:
+        return [
+            "  Super+Shift+Alt+R  Save current workspace -> ws s",
+            "  Super+Shift+R      Restore saved workspace -> ws r",
+        ]
+
+    width = max(len(combo) for combo, _, _ in rows)
+    return [f"  {combo:<{width}}  {description} -> {arg}" for combo, description, arg in rows]
+
+
+def shortcuts_help_block() -> str:
+    return "\n".join(session_shortcuts())
+
+
+def health_status() -> None:
+    install = Path(__file__)
+    try:
+        install = install.resolve()
+    except Exception:
+        pass
+    print("Omarchy session status")
+    print(f"  install: {install}")
+    print(f"  state:   {STATE_DIR}")
+    print(f"  autosave loop: {autosave_loop_status()}")
+    print(f"  default save:  {SESSION_FILE} ({count_session_windows(SESSION_FILE)} windows, {file_age(SESSION_FILE)})")
+    print(f"  latest autosave: {LATEST_AUTOSAVE} ({count_session_windows(LATEST_AUTOSAVE)} windows, {file_age(LATEST_AUTOSAVE)})")
+    print(f"  undo snapshot: {UNDO_FILE} ({count_session_windows(UNDO_FILE)} windows, {file_age(UNDO_FILE)})")
+    if LAST_RESTORE_FILE.exists():
+        try:
+            data = load_session(LAST_RESTORE_FILE)
+            launched = len(data.get("launched") or [])
+            print(f"  last restore: {launched} launched windows, {file_age(LAST_RESTORE_FILE)}")
+        except Exception:
+            print(f"  last restore: unreadable ({LAST_RESTORE_FILE})")
+    else:
+        print("  last restore: missing")
+    if LAST_RESTORE_AUDIT_FILE.exists():
+        try:
+            data = load_session(LAST_RESTORE_AUDIT_FILE)
+            verification = data.get("verification") or {}
+            verdict = "matched" if verification.get("matchedWellEnough") else "needs review"
+            print(f"  restore audit: {verdict}, {file_age(LAST_RESTORE_AUDIT_FILE)}")
+        except Exception:
+            print(f"  restore audit: unreadable ({LAST_RESTORE_AUDIT_FILE})")
+    else:
+        print("  restore audit: missing")
+    launcher = Path.home() / ".local/share/applications/omarchy-session.desktop"
+    print(f"  Super+Space launcher: {'installed' if launcher.exists() else 'missing'}")
+    print(f"  unknown classes: {unknown_classes_summary()}")
+    print("  shortcuts:")
+    print(shortcuts_help_block())
+    print("  commands: ws s, ws r, ws rs, ws plan, ws pick, ws menu, ws a, ws as, ws u, ws undo-hard, ws status, ws deps, ws unknowns")
+
+
+def list_session(path: Path = SESSION_FILE) -> None:
+    if not path.exists():
+        print(f"No saved session found at {path}")
+        return
+    data = load_session(path)
+    active = data.get("activeWindow") or {}
+    active_line = ""
+    if active:
+        active_line = f"Active: workspace {workspace_from_snapshot(active)} — {active.get('class')} — {active.get('title')}\n"
+    file_line = f"File: {human_path(path)}\n" if VERBOSE else ""
+    saved_line = f"Saved: {file_age(path)}"
+    if VERBOSE and data.get("savedAt"):
+        saved_line += f" ({data.get('savedAt')})"
+    print(f"{saved_line}\n{file_line}{active_line}")
+    items = restore_items(data)
+    group_by_address: dict[str, int] = {}
+    for group_index, addresses in enumerate(restore_group_members(items), 1):
+        for address in addresses:
+            group_by_address[address] = group_index
+    item_index = 0
+    for w in data.get("windows", []):
+        ws = workspace_spec(w)
+        if ws != "0":
+            item_index += 1
+        webapp_url, _ = browser_app_args(w)
+        suffix = f" [{human_path(w.get('restoreWorkdir'))}]" if VERBOSE and w.get("restoreWorkdir") else ""
+        if VERBOSE and w.get("restoreArgv"):
+            suffix += f" [restore: {shlex.join(w.get('restoreArgv') or [])}]"
+        if VERBOSE and w.get("agentSession"):
+            agent = w.get("agentSession") or {}
+            suffix += f" [session: {agent.get('tool')} {human_path(agent.get('id') or '')}]"
+        if (w.get("groupSize") or 0) > 1:
+            group_index = group_by_address.get(w.get("address") or "")
+            group_label = f"group {group_index}, " if group_index else ""
+            suffix += f" [{group_label}tab {int(w.get('groupIndex') or 0) + 1}/{w.get('groupSize')}]"
+        if w.get("monitorName"):
+            suffix += f" [monitor: {w.get('monitorName')}]"
+        if webapp_url:
+            suffix += f" [webapp: {webapp_url}]"
+        profile_summary = browser_profile_summary(w)
+        if profile_summary and not webapp_url:
+            suffix += f" [browser profile: {profile_summary}]"
+        prefix = f"item {item_index}: " if ws != "0" else ""
+        print(f"{prefix}workspace {ws}: {w.get('class')} — {w.get('title')}{suffix}")
+
+
+def usage() -> None:
+    prog = Path(sys.argv[0]).name
+    print(f"""Usage: {prog} [-v|--verbose] <command> [name]
+
+Options:
+  -v, --verbose          include saved file paths and restore metadata
+  -w, --workspace VALUE  save/restore only workspace(s), comma-separated
+  -g, --group VALUE      restore only saved group index(es), ranges allowed
+  -i, --item VALUE       restore only saved item index(es), ranges allowed
+
+Short commands:
+  s [name]    save (use `ws s name --workspace 3` for a workspace-only profile)
+  r [name]    restore only missing windows
+  plan [name] dry-run restore plan (no dispatch, launches, writes, notifications, or sleeps)
+  rs [name]   interactively select windows for a partial restore
+  l [name]    list (shows stable item/group indexes)
+  p           profiles/named setups
+  pick        pick a profile/autosave (`ws pick select` or `ws pick plan` for other actions)
+  a           autosave now
+  as          list autosaves
+  u           undo/restore pre-restore state
+  uh          hard undo: close windows launched by the last restore
+  st          status/health
+  deps        dependency check
+  menu        workspace-session action menu (also available from Super+Space)
+  unknowns    list app classes skipped as unknown during restore
+
+Full commands still work:
+  save [name], restore [selectors] [--dry-run|--plan] [name], select [name], plan [selectors] [name], dry-run [name], list [name], profiles, pick [restore|select|plan|list|path], autosave, autosaves, undo, undo-hard, status, deps, menu, unknowns, path [name]
+
+Current shortcuts:
+{shortcuts_help_block()}
+
+Files (shown in normal command output only with -v):
+  default:   {human_path(SESSION_FILE)}
+  named:     {human_path(PROFILE_DIR)}
+  autosaves: {human_path(AUTOSAVE_DIR)}  (keeps latest {AUTOSAVE_KEEP})
+""")
+
+
+def parse_global_flags(args: list[str]) -> list[str]:
+    global VERBOSE
+    parsed: list[str] = []
+    for arg in args:
+        if arg in {"--verbose", "-v"}:
+            VERBOSE = True
+        else:
+            parsed.append(arg)
+    return parsed
+
+
+def parse_name_and_restore_flags(args: list[str]) -> tuple[str | None, bool, dict]:
+    name: str | None = None
+    dry_run = False
+    selection = {"workspaces": set(), "groups": set(), "items": set()}
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in {"--dry-run", "--plan", "-n"}:
+            dry_run = True
+        elif arg in {"--"}:
+            pass
+        elif arg in {"--workspace", "-w", "--group", "-g", "--item", "-i"}:
+            if index + 1 >= len(args):
+                print(f"Missing value for {arg}", file=sys.stderr)
+                sys.exit(2)
+            index += 1
+            value = args[index]
+            try:
+                if arg in {"--workspace", "-w"}:
+                    selection["workspaces"].update(parse_workspace_selection(value))
+                elif arg in {"--group", "-g"}:
+                    selection["groups"].update(parse_number_selection(value, "group"))
+                else:
+                    selection["items"].update(parse_number_selection(value, "item"))
+            except ValueError as exc:
+                print(exc, file=sys.stderr)
+                sys.exit(2)
+        elif arg.startswith("--workspace="):
+            try:
+                selection["workspaces"].update(parse_workspace_selection(arg.split("=", 1)[1]))
+            except ValueError as exc:
+                print(exc, file=sys.stderr)
+                sys.exit(2)
+        elif arg.startswith("--group=") or arg.startswith("--item="):
+            option, value = arg.split("=", 1)
+            try:
+                selection["groups" if option == "--group" else "items"].update(
+                    parse_number_selection(value, "group" if option == "--group" else "item")
+                )
+            except ValueError as exc:
+                print(exc, file=sys.stderr)
+                sys.exit(2)
+        elif arg.startswith("-"):
+            print(f"Unknown option: {arg}", file=sys.stderr)
+            sys.exit(2)
+        elif name is None:
+            name = arg
+        else:
+            print(f"Unexpected extra argument: {arg}", file=sys.stderr)
+            sys.exit(2)
+        index += 1
+    return name, dry_run, selection
+
+
+def main() -> None:
+    args = parse_global_flags(sys.argv[1:])
+    cmd = args[0] if args else ""
+    rest = args[1:] if args else []
+    aliases = {
+        "s": "save",
+        "r": "restore",
+        "l": "list",
+        "p": "profiles",
+        "pk": "pick",
+        "rs": "select",
+        "a": "autosave",
+        "al": "autosave-loop",
+        "as": "autosaves",
+        "u": "undo",
+        "uh": "undo-hard",
+        "st": "status",
+        "unk": "unknowns",
+    }
+    cmd = aliases.get(cmd, cmd)
+    name, dry_run, selection = parse_name_and_restore_flags(rest)
+    if cmd == "save":
+        if selection["items"] or selection["groups"]:
+            print("Save supports --workspace, but not --item or --group", file=sys.stderr)
+            sys.exit(2)
+        try:
+            write_session(session_path(name), workspaces=selection["workspaces"] or None)
+        except ValueError as exc:
+            print(exc, file=sys.stderr)
+            sys.exit(2)
+    elif cmd == "autosave":
+        path = autosave_once(quiet=True)
+        target = f" ({human_path(path)})" if VERBOSE else ""
+        print(f"Autosaved {session_file_summary(path)}{target}")
+    elif cmd == "autosave-loop":
+        autosave_loop()
+    elif cmd in {"restore", "start"}:
+        if dry_run:
+            restore_dry_run(session_path(name), selection)
+        else:
+            restore(session_path(name), save_undo=True, selection=selection)
+    elif cmd in {"plan", "dry-run"}:
+        restore_dry_run(session_path(name), selection)
+    elif cmd == "plan-path":
+        if not name:
+            print("plan-path requires a saved session file", file=sys.stderr)
+            sys.exit(2)
+        restore_dry_run(Path(name), selection)
+    elif cmd == "undo":
+        restore(UNDO_FILE, save_undo=False)
+    elif cmd in {"undo-hard", "hard-undo"}:
+        hard_undo()
+    elif cmd == "status":
+        health_status()
+    elif cmd == "menu":
+        session_action_menu()
+    elif cmd in {"deps", "doctor", "check"}:
+        dependency_status()
+    elif cmd in {"unknowns", "unknown-classes"}:
+        list_unknown_classes()
+    elif cmd in {"list", "show"}:
+        list_session(session_path(name))
+    elif cmd == "list-undo":
+        list_session(UNDO_FILE)
+    elif cmd in {"profiles", "setups"}:
+        list_profiles()
+    elif cmd == "pick":
+        pick_session(name or "restore")
+    elif cmd in {"select", "partial"}:
+        path = session_path(name) if name else pick_session_path("ws select")
+        partial_restore_picker(path)
+    elif cmd in {"autosaves", "list-autosaves"}:
+        list_autosaves()
+    elif cmd == "path":
+        print(session_path(name))
+    else:
+        usage()
+
+
+if __name__ == "__main__":
+    main()

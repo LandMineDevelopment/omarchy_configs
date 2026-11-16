@@ -24,3 +24,5 @@ waybar
 wofi
 xdg-desktop-portal-hyprland
 xdg-desktop-portal-gtk
+mise
+ttf-jetbrains-mono-nerd

@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Restore locally used apps that omarchy-session intentionally does not launch."""
+
+import json
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+
+SESSION = Path.home() / ".local/state/omarchy-session/autosaves/latest.json"
+DRY_RUN = "--dry-run" in sys.argv[1:]
+HOME = Path.home().resolve()
+
+
+def current_clients() -> list[dict]:
+    try:
+        return json.loads(subprocess.check_output(["hyprctl", "clients", "-j"], text=True))
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return []
+
+
+def current_classes() -> set[str]:
+    return {(client.get("class") or "").lower() for client in current_clients()}
+
+
+def workspace(window: dict) -> str:
+    value = (window.get("workspace") or {}).get("id")
+    return str(value) if isinstance(value, int) and value > 0 else "1"
+
+
+def safe_document_args(window: dict) -> list[str]:
+    documents: list[str] = []
+    for arg in window.get("procArgv") or []:
+        candidate = ""
+        if isinstance(arg, str) and arg.startswith("file://"):
+            candidate = unquote(urlparse(arg).path)
+        elif isinstance(arg, str) and arg.startswith("/"):
+            candidate = arg
+        if not candidate:
+            continue
+        path = Path(candidate).resolve()
+        if path.is_file() and path.is_relative_to(HOME):
+            documents.append(str(path))
+    return documents
+
+
+def launch(command: list[str], target_workspace: str) -> bool:
+    if not shutil.which(command[0]):
+        print(f"Skipping unavailable local app: {command[0]}", file=sys.stderr)
+        return False
+    rendered = shlex.join(["uwsm", "app", "--", *command])
+    if DRY_RUN:
+        print(f"Would launch on workspace {target_workspace}: {shlex.join(command)}")
+        return True
+    code = (
+        f"hl.dispatch(hl.dsp.exec_cmd({json.dumps(rendered, ensure_ascii=False)}, "
+        f"{{ workspace = {json.dumps(target_workspace + ' silent')} }}))"
+    )
+    result = subprocess.run(
+        ["hyprctl", "eval", code],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        print(
+            f"Unable to launch on workspace {target_workspace}: {shlex.join(command)} "
+            f"(hyprctl status {result.returncode})",
+            file=sys.stderr,
+        )
+        return False
+    print(f"Launched on workspace {target_workspace}: {shlex.join(command)}")
+    return True
+
+
+def restore_brave_workspaces(windows: list[dict]) -> None:
+    saved = [window for window in windows if (window.get("class") or "").lower() in {"brave", "brave-browser"}]
+    if len(saved) < 2:
+        return
+
+    deadline = time.monotonic() + (0 if DRY_RUN else 10)
+    while True:
+        live = [client for client in current_clients() if (client.get("class") or "").lower() in {"brave", "brave-browser"}]
+        live_by_title: dict[str, list[dict]] = {}
+        for client in live:
+            title = client.get("title") or ""
+            if title:
+                live_by_title.setdefault(title, []).append(client)
+
+        matched = 0
+        for window in saved:
+            title = window.get("title") or ""
+            candidates = live_by_title.get(title, [])
+            if len(candidates) != 1:
+                continue
+            client = candidates[0]
+            matched += 1
+            target_workspace = workspace(window)
+            current_workspace = str((client.get("workspace") or {}).get("id") or "")
+            address = client.get("address") or ""
+            if not address or current_workspace == target_workspace:
+                continue
+            if DRY_RUN:
+                print(f"Would move Brave window to workspace {target_workspace}: {title}")
+            else:
+                code = (
+                    "hl.dispatch(hl.dsp.window.move({ "
+                    f"workspace = {json.dumps(target_workspace)}, "
+                    f"window = {json.dumps('address:' + address)}, follow = false }}))"
+                )
+                subprocess.run(
+                    ["hyprctl", "eval", code],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                print(f"Moved Brave window to workspace {target_workspace}: {title}")
+
+        if matched == len(saved) or time.monotonic() >= deadline:
+            return
+        time.sleep(0.5)
+
+
+def main() -> int:
+    if not SESSION.exists():
+        return 0
+    try:
+        windows = json.loads(SESSION.read_text()).get("windows", [])
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"Unable to read {SESSION}: {error}", file=sys.stderr)
+        return 1
+
+    open_classes = current_classes()
+    t3_launched = bool({"t3code", "com.t3tools.t3code"} & open_classes)
+    libreoffice_open = any(name.startswith("libreoffice-") for name in open_classes)
+    launched_documents: set[str] = set()
+
+    for window in windows:
+        app_class = (window.get("class") or "").lower()
+        target_workspace = workspace(window)
+
+        if app_class in {"t3code", "com.t3tools.t3code"} and not t3_launched:
+            # The local launcher preserves the official AppImage and applies
+            # background transparency. An absolute path also works at boot.
+            t3_launched = launch(["/usr/bin/t3code-nightly"], target_workspace)
+            continue
+
+        if not app_class.startswith("libreoffice-") or libreoffice_open:
+            continue
+
+        mode = {
+            "libreoffice-writer": "--writer",
+            "libreoffice-calc": "--calc",
+            "libreoffice-impress": "--impress",
+            "libreoffice-draw": "--draw",
+            "libreoffice-base": "--base",
+            "libreoffice-math": "--math",
+        }.get(app_class, "")
+        documents = [path for path in safe_document_args(window) if path not in launched_documents]
+        command = ["libreoffice"]
+        if mode:
+            command.append(mode)
+        command.extend(documents)
+        launch(command, target_workspace)
+        launched_documents.update(documents)
+
+    restore_brave_workspaces(windows)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

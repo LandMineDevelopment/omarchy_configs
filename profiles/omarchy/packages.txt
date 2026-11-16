@@ -1,1 +1,41 @@
-# Omarchy supplies the compositor, shell, portals, and desktop services.
+# Explicitly installed personal additions to Omarchy (audited 2026-11-16).
+# Core Omarchy packages, dependencies, hardware drivers, and kernels are excluded.
+# Provider names below match the current Omarchy repositories.
+1password
+1password-cli
+7zip
+brave-bin
+clang
+dbeaver
+dotnet-runtime-9.0
+freerdp
+github-cli
+graphviz
+hunspell-en_us
+kdenlive
+lazydocker
+llvm
+mise-bin
+noto-fonts-extra
+obs-studio
+once-bin
+openai-codex-desktop
+openbsd-netcat
+postgresql
+python-psycopg
+rainfrog
+rustup
+signal-desktop
+spotify
+steam
+sunshine
+synology-drive
+t3code-nightly-bin
+tailscale
+ttf-cascadia-mono-nerd
+ttf-jetbrains-mono-nerd-basic
+typora
+vim
+xmlstarlet
+xournalpp
+yq

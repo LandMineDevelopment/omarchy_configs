@@ -1,0 +1,10 @@
+[Unit]
+Description=Autosave the Omarchy workspace session after changes
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/omarchy-session-watch
+Restart=on-failure
+RestartSec=2s

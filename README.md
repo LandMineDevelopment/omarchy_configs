@@ -35,9 +35,25 @@ Package installation remains repository-wide and is intentionally separate
 from component restores, so `--component` and `--install-packages` cannot be
 combined.
 
-The restore is additive and idempotent. Before replacing a differing file, it
-copies the old version to `~/.local/state/omarchy-config-backups/<timestamp>/`.
-It never deletes an existing `~/.config` repository or application state.
+The restore is additive and idempotent. By default it adds missing files and
+preserves existing differing files, reporting each conflict. Review a dry run
+first. Use `--overwrite` only when you want the saved settings to replace those
+files; originals are backed up to `~/.local/state/omarchy-config-backups/<timestamp>/`.
+Destination symlinks are never followed for replacement, and parent symlinks
+escaping the destination root are refused. No reset, pruning, service enabling,
+or account/data restoration runs automatically.
+
+```bash
+./bootstrap.sh --profile omarchy --dry-run
+./bootstrap.sh --profile omarchy --component hypr --overwrite --dry-run
+```
+
+`local/bin` and `local/share` hold reviewed source payloads restored to
+`~/.local/bin` and `${XDG_DATA_HOME:-~/.local/share}`, separately from configuration.
+[Custom setup](CUSTOM-SETUP.md) documents activation and manual dependencies.
+[Software inventory](profiles/omarchy/installed-software.md) explains the curated
+package manifest and hardware exclusions. Package installation is opt-in, adds
+missing software only, and separates repository packages from AUR packages.
 
 Install and apply the separately versioned theme:
 
@@ -48,8 +64,8 @@ omarchy theme set primary-space
 
 ## Included
 
-- Hyprland Lua overrides and monitor scale
-- Omarchy shell layout, idle settings, menu extension, and default agent
+- Hyprland Lua overrides, Super+Q window closing, and monitor scale
+- Omarchy shell layout, custom plugins, idle settings, menu extension, and default agent
 - Ghostty, Alacritty, Kitty, XTerm, Tmux, and Herdr configuration
 - Neovim, Yazi, Starship, Git, Mise, btop, and Fcitx settings
 - Default applications, browser flags, autostart overrides, and Bluetooth audio
